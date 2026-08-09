@@ -1,7 +1,7 @@
 # VW2026 Python API expansion roadmap for vwx-mcp
 
 > **STATUS 2026-07-07 — GOAL EXCEEDED.** This roadmap targeted ~215–225 tools;
-> the server is now at **248 tools** after four SDK-enrichment batches
+> the server is now at **290 tools** after SDK enrichment and guarded workflow additions
 > (3D/NURBS/booleans/calc → architecture/lights/criteria/worksheets →
 > criteria-driven report worksheets / IFC-deep bulk classification / textures /
 > document defaults → GIS coordinate engine / polygon vertex editing) plus the

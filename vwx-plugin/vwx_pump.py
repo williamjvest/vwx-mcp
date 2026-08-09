@@ -36,6 +36,9 @@ try:
 except NameError:                      # VW runs scripts as <string>
     _base = os.path.join(os.environ.get('APPDATA', ''),
                          'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
+    if not os.environ.get('APPDATA'):  # macOS/Linux: no APPDATA, use Application Support
+        _base = os.path.expanduser(
+            '~/Library/Application Support/Vectorworks/2026/Plug-ins')
     for _name in ('VW-MCP', 'VWX-MCP'):
         _cand = os.path.join(_base, _name)
         if os.path.isdir(_cand):
@@ -64,6 +67,10 @@ _RO_NAMES = frozenset({
 })
 _RO_PREFIXES = ('get_', 'list_', 'count_', 'find_')
 
+# No mutation is allowed before a document has a real path. In particular,
+# both Save and Save As can open modal dialogs and strand the file-IPC pump.
+_UNSAVED_ALLOWED = frozenset()
+
 # Marionette executions may tear down THIS Python context on frame return:
 # their ack is written BEFORE dispatch.
 _FIRE_AND_FORGET = frozenset({'marionette_recalc'})
@@ -79,6 +86,29 @@ def _log(msg):
 
 def _is_readonly(cmd):
     return cmd in _RO_NAMES or cmd.startswith(_RO_PREFIXES)
+
+
+def _unsaved_document_error(cmd):
+    """Fail closed on mutations until the active document has a real path."""
+    if _is_readonly(cmd) or cmd in _UNSAVED_ALLOWED:
+        return None
+    try:
+        import vs
+        path = str(vs.GetFPathName() or '').strip()
+        name = str(vs.GetFName() or '').strip()
+    except Exception:
+        path = ''
+        name = ''
+    if path and os.path.isabs(os.path.normpath(path)):
+        return None
+    return {
+        'error': ('Refusing mutation on an unsaved Vectorworks document. '
+                  'Save it with a name before running %s.' % cmd),
+        'code': 'UNSAVED_DOCUMENT',
+        'command': cmd,
+        'document_name': name,
+        'document_path': path,
+    }
 
 
 def _write_json(path, obj):
@@ -108,7 +138,7 @@ def _get_commands():
 def _dispatch(cmd, params):
     try:
         commands = _get_commands()
-        fn = getattr(commands, cmd, None)
+        fn = getattr(commands, cmd, None) if cmd == '_batch' or not str(cmd).startswith('_') else None
         if fn is None:
             return {'error': 'Unknown command: %s' % cmd}
         return fn(params)
@@ -153,6 +183,11 @@ def _claim_and_run(fn):
     cmd    = msg.get('type', '')
     params = msg.get('params', {}) or {}
     rpath  = os.path.join(_RESULTS, cid + '.json')
+    gate_error = _unsaved_document_error(cmd)
+    if gate_error:
+        _write_json(rpath, gate_error)
+        _log("blocked unsaved-document mutation cid=%s cmd=%s" % (cid, cmd))
+        return True
     if cmd in _FIRE_AND_FORGET and not params.get('_sync'):
         _write_json(rpath, {'status': 'triggered',
                             'note': 'Marionette execution — ack before dispatch.'})

@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (248). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (290). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -31,9 +31,9 @@ do not use them. Tool results return `object_id` = the UUID.
 ## Toolset presets
 
 If the client is loading too many tools, set `VWX_TOOLSET` (env, in the launcher):
-`full` | `gis` | `modeling` | `baumkataster` | `minimal`. Mapping lives in
+`full` | `mechanical` | `gis` | `modeling` | `baumkataster` | `minimal`. Mapping lives in
 `mcp-server/tool_tags.py`. Filtering uses the fastmcp Visibility API
-(`mcp.enable(tags=…, only=True)`).
+(`mechanical` is an exact-name allowlist; broad presets use tags).
 
 ## VW2026 API gotchas (silent failures — memorize these)
 
@@ -220,7 +220,7 @@ boolean — `_nums()` in commands.py strips flags generically.
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts every tool is tagged — currently 248/248).
+  (a probe asserts every tool is tagged — currently 290/290).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual
@@ -239,7 +239,7 @@ Set in `bridge/vwx-mcp.bat`.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `VWX_TOOLSET` | `full` | Toolset preset: `full`/`gis`/`modeling`/`baumkataster`/`minimal` |
+| `VWX_TOOLSET` | `full` | Toolset preset: `full`/`mechanical`/`gis`/`modeling`/`baumkataster`/`minimal` |
 | `VWX_CALL_TIMEOUT` | `60` | Per-tool timeout (s) — native `@mcp.tool(timeout=)` on every tool |
 | `VWX_TASKS` | _(off)_ | Opt long-running tools into the MCP Tasks extension. Needs `pip install 'fastmcp[tasks]'` **and** a Tasks-capable client; warns + stays off otherwise |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | If set, exports fastmcp's spans via OTLP. Needs `opentelemetry-exporter-otlp` |

@@ -1,0 +1,55 @@
+{
+  "captured_at": "2026-07-27T19:57:02.848615+00:00",
+  "host": "Emmett",
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "plugin_dir": "/Users/williamvest/Library/Application Support/Vectorworks/2026/Plug-ins/VWX-MCP",
+  "paths": {
+    "file_ipc": {
+      "cases": {
+        "ping": {
+          "runs": 30,
+          "median_ms": 146.1,
+          "p95_ms": 165.5,
+          "min_ms": 55.9,
+          "max_ms": 177.2
+        },
+        "document_info": {
+          "runs": 30,
+          "median_ms": 143.9,
+          "p95_ms": 160.3,
+          "min_ms": 114.9,
+          "max_ms": 166.5
+        }
+      }
+    },
+    "mcp_http": {
+      "tool_count": 56,
+      "cases": {
+        "ping": {
+          "runs": 30,
+          "median_ms": 148.2,
+          "p95_ms": 163.5,
+          "min_ms": 96.5,
+          "max_ms": 185.4
+        },
+        "document_info": {
+          "runs": 30,
+          "median_ms": 148.8,
+          "p95_ms": 164.3,
+          "min_ms": 89.3,
+          "max_ms": 173.2
+        }
+      }
+    }
+  },
+  "mcp_overhead_ms": {
+    "document_info": {
+      "median_ms": 4.9,
+      "p95_ms": 4.0
+    },
+    "ping": {
+      "median_ms": 2.1,
+      "p95_ms": -2.0
+    }
+  }
+}

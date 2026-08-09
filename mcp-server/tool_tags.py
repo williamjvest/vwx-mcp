@@ -22,6 +22,27 @@ TOOL_TAGS = {
     # document
     "ping": "document",
     "get_document_info": "document",
+    "workspace_snapshot": "document",
+    "find_library_resources": "resources",
+    "ensure_resources": "resources",
+    "ensure_project_standards": "resources",
+    "ensure_drawing_package": "document",
+    "compile_vw_project": "document",
+    "list_assembly_templates": "document",
+    "expand_assembly_template": "document",
+    "semantic_object_search": "query",
+    "select_semantic_objects": "query",
+    "index_document": "query",
+    "search_document": "query",
+    "compile_document_changes": "document",
+    "plan_auto_dimensions": "document",
+    "sync_drawing_package": "document",
+    "compile_drawing_set": "document",
+    "get_revision_snapshot": "document",
+    "manage_revision_baseline": "document",
+    "get_revision_diff": "document",
+    "ensure_revision_report": "document",
+    "qa_autopilot": "document",
     "save_document": "document",
     "save_document_as": "document",
     "get_document_preferences": "document",
@@ -56,6 +77,14 @@ TOOL_TAGS = {
     "for_each_criteria": "query",
     "offset_polygon": "query",
     "polygon_centroid": "query",
+    "get_assembly_manifest": "query",
+    "get_assembly_diff": "query",
+    "plan_native_frame_rebuild": "query",
+    "verify_native_frame_rebuild": "query",
+    "plan_normalize_assembly": "query",
+    "verify_normalize_assembly": "query",
+    "assembly_floor_report": "query",
+    "assembly_qa_bundle": "query",
     # manipulate
     "move_object": "manipulate",
     "rotate_object": "manipulate",
@@ -70,6 +99,15 @@ TOOL_TAGS = {
     "mirror_object": "manipulate",
     "align_objects": "manipulate",
     "distribute_objects": "manipulate",
+    "place_member_between_faces": "manipulate",
+    "place_member_between_faces_guarded": "manipulate",
+    "create_verified_native_boxes": "draw3d",
+    "reconcile_verified_native_boxes": "manipulate",
+    "bulk_transform_objects": "manipulate",
+    "execute_native_frame_rebuild": "manipulate",
+    "commit_native_frame_rebuild": "manipulate",
+    "rollback_native_frame_rebuild": "manipulate",
+    "execute_normalize_assembly": "manipulate",
     # draw2d
     "draw_line": "draw2d",
     "draw_rectangle": "draw2d",
@@ -137,6 +175,7 @@ TOOL_TAGS = {
     "create_material": "bim",
     "assign_material": "bim",
     "list_components": "bim",
+    "edit_components": "bim",
     "insert_component": "bim",
     # landscape (Baumkataster)
     "get_plants": "landscape",
@@ -169,6 +208,7 @@ TOOL_TAGS = {
     "export_pdf": "io",
     "export_dxf": "io",
     "export_image": "io",
+    "export_stl": "io",
     "import_dwg": "io",
     "export_shp": "io",
     "import_image": "io",
@@ -177,6 +217,8 @@ TOOL_TAGS = {
     "zoom_to_selection": "view",
     "set_zoom": "view",
     "refresh_view": "view",
+    "save_qa_view": "view",
+    "restore_qa_view": "view",
     # geo (georeferencing)
     "set_georeferencing": "geo",
     "get_georeferencing": "geo",
@@ -288,7 +330,9 @@ TOOL_TAGS = {
     "get_object_variable": "escape",
 }
 
-# workflow presets -> set of tags to enable (only=True). "full" = no filtering.
+# Workflow presets usually select whole tags. Exact-name presets use explicit
+# names instead, which keeps a focused workflow genuinely small even when a
+# broad tag such as ``manipulate`` has grown to dozens of tools.
 PRESETS = {
     "full": None,  # sentinel: enable everything
     "gis": {"query", "layers", "classes", "appearance", "io", "geo",
@@ -300,10 +344,54 @@ PRESETS = {
     "minimal": {"document", "query", "escape"},
 }
 
+# Exact tool allowlists. ``mechanical`` is the day-to-day shop / cart / frame
+# modeling surface: inspect, place, transform, verify, and save. The generic
+# vwx/execute_script escape hatches remain available for rare operations without
+# making clients ingest every explicit schema.
+PRESET_TOOLS = {
+    "mechanical": {
+        "ping", "workspace_snapshot", "get_document_info",
+        "find_library_resources", "ensure_resources",
+        "ensure_project_standards",
+        "ensure_drawing_package",
+        "compile_vw_project",
+        "list_assembly_templates", "expand_assembly_template",
+        "semantic_object_search", "select_semantic_objects",
+        "index_document", "search_document", "compile_document_changes",
+        "plan_auto_dimensions", "sync_drawing_package", "compile_drawing_set",
+        "get_revision_snapshot", "manage_revision_baseline",
+        "get_revision_diff", "ensure_revision_report", "qa_autopilot",
+        "get_document_units", "save_document",
+        "get_layers", "get_active_layer", "set_active_layer", "get_classes",
+        "get_objects", "get_object_info", "get_selected_objects",
+        "get_object_bounds", "find_objects_by_name", "criteria_count",
+        "for_each_criteria", "get_assembly_manifest",
+        "assembly_floor_report", "assembly_qa_bundle", "get_assembly_diff",
+        "get_3d_info", "select_objects", "deselect_all", "move_object",
+        "move_object_3d", "rotate_object_3d", "delete_object",
+        "duplicate_object", "set_object_layer", "set_object_class",
+        "set_object_name", "bulk_transform_objects",
+        "create_verified_native_boxes", "reconcile_verified_native_boxes",
+        "place_member_between_faces_guarded",
+        "align_objects", "distribute_objects", "mirror_object", "draw_box",
+        "draw_rectangle", "draw_polyline", "draw_extrude", "place_symbol",
+        "get_symbols", "set_3d_view", "zoom_to_fit", "zoom_to_selection",
+        "refresh_view", "vwx", "vwx_batch", "list_commands", "vs_signature",
+        "execute_script", "get_materials", "assign_material", "get_textures",
+        "edit_components",
+        "set_object_texture",
+    },
+}
+
 
 def preset_tags(preset: str):
     """Return the tag set for a preset name, or None for 'full'/unknown."""
     return PRESETS.get(preset)
+
+
+def preset_names(preset: str):
+    """Return explicit FastMCP tool names for an exact-name preset, if any."""
+    return PRESET_TOOLS.get(preset)
 
 
 def all_tags():

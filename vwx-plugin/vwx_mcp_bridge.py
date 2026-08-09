@@ -29,6 +29,9 @@ try:
 except NameError:
     _base = os.path.join(os.environ.get('APPDATA', ''),
                          'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
+    if not os.environ.get('APPDATA'):  # macOS/Linux: no APPDATA, use Application Support
+        _base = os.path.expanduser(
+            '~/Library/Application Support/Vectorworks/2026/Plug-ins')
     for _name in ('VWX-MCP', 'VW-MCP'):
         _cand = os.path.join(_base, _name)
         if os.path.isdir(_cand):
@@ -108,7 +111,7 @@ def _dispatch(cmd, params):
     try:
         import commands, importlib
         importlib.reload(commands)          # hot-reload: edits take effect immediately
-        fn = getattr(commands, cmd, None)
+        fn = getattr(commands, cmd, None) if cmd == '_batch' or not str(cmd).startswith('_') else None
         if fn is None:
             return {'error': f'Unknown command: {cmd}'}
         return fn(params)

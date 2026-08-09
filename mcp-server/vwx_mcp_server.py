@@ -31,6 +31,9 @@ VWX_CALL_TIMEOUT = float(os.environ.get("VWX_CALL_TIMEOUT", "60"))
 # freezes the bridge's I/O threads. Keep just under VWX_CALL_TIMEOUT so the
 # socket error surfaces before the MCP layer kills the call.
 VWX_SOCKET_TIMEOUT = float(os.environ.get("VWX_SOCKET_TIMEOUT", "55"))
+# File-transport result polling is active only while a tool call is waiting.
+# 10ms keeps CPU negligible but removes most of the old 30ms quantization delay.
+VWX_RESULT_POLL = max(0.003, float(os.environ.get("VWX_RESULT_POLL", "0.01")))
 
 # MCP Tasks extension (RC spec, finalizes 2026-07-28). OFF by default: a task=True
 # tool returns a task handle the client must poll (tasks/get), which breaks clients
@@ -148,7 +151,7 @@ class VwxFileTransport:
                 logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} "
                             f"status={status} transport=file")
                 return result
-            time.sleep(0.03)
+            time.sleep(VWX_RESULT_POLL)
         # timed out: remove the job if the pump never claimed it
         try:
             if os.path.exists(jp):
@@ -329,6 +332,119 @@ def cmd(command_type, params=None):
     return json.dumps(get_vwx_connection().send_command(command_type, params), indent=2)
 
 
+def _member_box_fallback_eligible(profile: str,
+                                  keywords: Optional[List[str]] = None) -> bool:
+    """Only solid rectangular profile families may fall back to a native box."""
+    text = str(profile or '').lower()
+    words = keywords or ["strap", "flat bar", "plate", "solid bar"]
+    return any(str(word).lower() in text for word in words)
+
+
+def _guarded_member_placement(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Orchestrate separate VW dispatches across the PIO regeneration barrier."""
+    connection = get_vwx_connection()
+    phases: List[Dict[str, Any]] = []
+
+    def run(command: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        result = connection.send_command(command, payload)
+        phases.append({"command": command, "result": result})
+        return result
+
+    tolerance = abs(float(params.get("tolerance", 0.01)))
+
+    def create_fallback(spec: Dict[str, Any],
+                        pio_verification: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        allow_fallback = bool(params.get("allow_native_box_fallback", True))
+        eligible = _member_box_fallback_eligible(
+            spec.get("profile"), params.get("fallback_keywords"))
+        if not allow_fallback or not eligible:
+            return {"error": "Structural Member failed and native-box fallback is unavailable",
+                    "fallback_allowed": allow_fallback, "fallback_eligible": eligible,
+                    "pio_verification": pio_verification, "phases": phases}
+        dimensions = spec.get("dimensions") or {}
+        target = spec.get("target_center") or {}
+        name = spec.get("name") or params.get("name") or ""
+        create_payload: Dict[str, Any] = {
+            "confirm": True, "expected_count": 1, "tolerance": tolerance,
+            "items": [{"name": name, "center": target, "dimensions": dimensions}],
+        }
+        for source_key, target_key in (
+                ("layer", "layer"), ("class", "class"),
+                ("material", "material_name"), ("texture", "texture_name"),
+                ("parent_id", "parent_id")):
+            value = spec.get(source_key)
+            if value: create_payload[target_key] = value
+        fallback = run("create_verified_native_boxes", create_payload)
+        created = fallback.get("created") or []
+        if fallback.get("error") or len(created) != 1:
+            return {"error": "native-box fallback creation failed", "phases": phases}
+        fallback_id = created[0].get("object_id")
+        fallback_verify = run("verify_native_member_fallback", {
+            "object_id": fallback_id, "target_center": target,
+            "dimensions": dimensions, "parent_id": spec.get("parent_id") or "",
+            "name": name, "tolerance": tolerance,
+        })
+        if not fallback_verify.get("clean"):
+            run("delete_object", {"object_id": fallback_id})
+            return {"error": "fresh native-box fallback verification failed",
+                    "fallback_removed": True, "verification": fallback_verify,
+                    "phases": phases}
+        return {"status": "ok", "fallback_used": True,
+                "object_id": fallback_id, "member_type": "native_extrude",
+                "profile": spec.get("profile"),
+                "pio_verification": pio_verification,
+                "verification": fallback_verify, "phases": phases,
+                "final_save_required": True}
+
+    provisional = run("place_member_between_faces", params)
+    if provisional.get("error") or not provisional.get("object_id"):
+        spec = run("native_member_fallback_spec", params)
+        if spec.get("error"):
+            return {"error": "provisional placement and fallback-spec derivation failed",
+                    "phases": phases}
+        return create_fallback(spec, provisional)
+
+    object_id = provisional["object_id"]
+    phase_payload = {
+        "object_id": object_id,
+        "source_id": provisional.get("source_id"),
+        "axis": provisional.get("axis"),
+        "target_center": provisional.get("target_center"),
+        "desired_length": abs(float(provisional["faces"][1]) -
+                              float(provisional["faces"][0])),
+        "tolerance": tolerance,
+    }
+    finalized = run("finalize_member_between_faces", phase_payload)
+    if finalized.get("error"):
+        run("delete_object", {"object_id": object_id})
+        spec = run("native_member_fallback_spec", params)
+        if spec.get("error"):
+            return {"error": "post-regeneration finalization and fallback-spec derivation failed",
+                    "provisional_removed": True, "phases": phases}
+        result = create_fallback(spec, finalized)
+        result["provisional_removed"] = True
+        return result
+
+    verify_payload = dict(phase_payload)
+    verify_payload["parent_id"] = provisional.get("parent_id") or ""
+    verified = run("verify_member_between_faces_fresh", verify_payload)
+    if verified.get("clean"):
+        return {"status": "ok", "fallback_used": False,
+                "object_id": object_id, "member_type": "StructuralMember",
+                "profile": provisional.get("profile"), "verification": verified,
+                "phases": phases, "final_save_required": True}
+
+    run("delete_object", {"object_id": object_id})
+    spec = run("native_member_fallback_spec", params)
+    if spec.get("error"):
+        return {"error": "fresh Structural Member verification and fallback-spec derivation failed",
+                "provisional_removed": True, "verification": verified,
+                "phases": phases}
+    result = create_fallback(spec, verified)
+    result["provisional_removed"] = True
+    return result
+
+
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     logger.info("VWX MCP server starting")
@@ -401,6 +517,21 @@ def ping(ctx: Context) -> str:
 def get_document_info(ctx: Context) -> str:
     """Get current document info: filename, path, units, scale, version"""
     return cmd("get_document_info")
+
+@vtool
+def workspace_snapshot(ctx: Context, include_selection: bool = True,
+                       selection_limit: int = 20,
+                       include_layers: bool = False,
+                       assembly: Optional[Dict[str, Any]] = None) -> str:
+    """Compact kickoff snapshot: document, units, active layer, selection,
+    optional layers, and optional compact assembly QA in one round-trip."""
+    p: Dict[str, Any] = {
+        "include_selection": include_selection,
+        "selection_limit": selection_limit,
+        "include_layers": include_layers,
+    }
+    if assembly: p["assembly"] = assembly
+    return cmd("workspace_snapshot", p)
 
 @vtool
 def save_document(ctx: Context) -> str:
@@ -578,6 +709,194 @@ def find_objects_by_name(ctx: Context, name: str) -> str:
     """Find objects by name (exact or partial match)"""
     return cmd("find_objects_by_name", {"name": name})
 
+@vtool
+def get_assembly_manifest(ctx: Context, layer: str,
+                          region: Optional[Dict[str, float]] = None,
+                          roles: Optional[List[str]] = None,
+                          profiles: Optional[List[str]] = None,
+                          name_prefix: Optional[str] = None,
+                          limit: int = 1000, guard: int = 60000) -> str:
+    """Safely inventory an assembly recursively on one design layer.
+
+    Descends groups; treats symbol instances and Structural Member PIOs as
+    semantic parts; includes only prefiltered simple mesh panels/straps/tubes.
+    Never runs Centroid3D on arbitrary imported groups. Optional region is
+    {x1,y1,x2,y2}; roles/profiles/name_prefix narrow the returned rows.
+    """
+    p: Dict[str, Any] = {"layer": layer, "limit": limit, "guard": guard}
+    if region: p["region"] = region
+    if roles: p["roles"] = roles
+    if profiles: p["profiles"] = profiles
+    if name_prefix: p["name_prefix"] = name_prefix
+    return cmd("get_assembly_manifest", p)
+
+@vtool
+def get_assembly_diff(ctx: Context, expected: Any, actual: Any,
+                      tolerance: float = 0.01,
+                      match_by: Optional[List[str]] = None,
+                      compare_fields: Optional[List[str]] = None) -> str:
+    """Compare expected and actual assembly rows.
+
+    Inputs may be row lists or manifest dicts. Defaults to matching by name and
+    comparing profile, symbol, role, axis, center, and dimensions. Returns
+    missing, extra, mismatched, and a clean/zero-diff summary.
+    """
+    p: Dict[str, Any] = {"expected": expected, "actual": actual,
+                         "tolerance": tolerance}
+    if match_by: p["match_by"] = match_by
+    if compare_fields: p["compare_fields"] = compare_fields
+    return cmd("get_assembly_diff", p)
+
+@vtool
+def plan_native_frame_rebuild(
+        ctx: Context, layer: str, reference_prefix: str, output_prefix: str,
+        expected_count: int, profile_rules: Any, source_map: Dict[str, str],
+        region: Optional[Dict[str, float]] = None,
+        include_name_contains: Optional[List[str]] = None,
+        exclude_name_contains: Optional[List[str]] = None,
+        orientation_profiles: Optional[List[str]] = None,
+        material_name: Optional[str] = None,
+        texture_name: Optional[str] = None,
+        target_class: Optional[str] = None,
+        tolerance: float = 0.01,
+        vertical_mode: str = "profile_extrude") -> str:
+    """Dry-run a guarded imported/reference-frame rebuild.
+
+    Scans named reference objects inside `region`, resolves profiles from ordered
+    rules, and resolves source Structural Members by semantic object name (UUIDs
+    also accepted). Requires an exact expected_count. Returns plan_id plus a
+    confirm_token; no document geometry is changed. Source-map keys are
+    `Profile|axis`, e.g. `Tube_1x1|x`. Pure-Z members use a native profile
+    extrude because VW2026 produces zero-depth vertical Structural Members.
+    """
+    p: Dict[str, Any] = {
+        "layer": layer, "reference_prefix": reference_prefix,
+        "output_prefix": output_prefix, "expected_count": expected_count,
+        "profile_rules": profile_rules, "source_map": source_map,
+        "tolerance": tolerance, "vertical_mode": vertical_mode,
+    }
+    if region: p["region"] = region
+    if include_name_contains: p["include_name_contains"] = include_name_contains
+    if exclude_name_contains: p["exclude_name_contains"] = exclude_name_contains
+    if orientation_profiles: p["orientation_profiles"] = orientation_profiles
+    if material_name: p["material_name"] = material_name
+    if texture_name: p["texture_name"] = texture_name
+    if target_class is not None: p["target_class"] = target_class
+    return cmd("plan_native_frame_rebuild", p)
+
+@vtool
+def execute_native_frame_rebuild(ctx: Context, plan_id: str,
+                                 confirm_token: str) -> str:
+    """Additively create/finalize a planned native frame; never deletes originals.
+
+    The first call creates and queues Structural Member regeneration. Repeat this
+    action with the same plan/token in a NEW MCP call to persist PIO elevation,
+    then call verify_native_frame_rebuild in another new call.
+    """
+    return cmd("execute_native_frame_rebuild",
+               {"plan_id": plan_id, "confirm_token": confirm_token})
+
+@vtool
+def verify_native_frame_rebuild(ctx: Context, plan_id: str) -> str:
+    """Post-regeneration readback for a created native-frame rebuild plan."""
+    return cmd("verify_native_frame_rebuild", {"plan_id": plan_id})
+
+@vtool
+def commit_native_frame_rebuild(ctx: Context, plan_id: str,
+                                confirm_token: str,
+                                save_checkpoint: bool = True) -> str:
+    """After a fresh clean verification, delete only the planned originals.
+
+    Saves the named document before deletion by default, leaves the committed
+    deletion dirty for visual QA, and returns `final_save_required=true`.
+    """
+    return cmd("commit_native_frame_rebuild",
+               {"plan_id": plan_id, "confirm_token": confirm_token,
+                "save_checkpoint": save_checkpoint})
+
+@vtool
+def rollback_native_frame_rebuild(ctx: Context, plan_id: str,
+                                  confirm_token: str) -> str:
+    """Remove additive native objects while preserving the planned originals."""
+    return cmd("rollback_native_frame_rebuild",
+               {"plan_id": plan_id, "confirm_token": confirm_token})
+
+@vtool
+def plan_normalize_assembly(ctx: Context, layer: str, assembly_name: str,
+                            expected_model_count: int,
+                            target_floor: float = 0.0,
+                            helper_name: Optional[str] = None,
+                            helper_class: str = "NonPlot",
+                            tolerance: float = 0.01) -> str:
+    """Dry-run semantic grouping/naming and exact floor alignment for one assembly.
+
+    Requires the expected semantic model-child count. Degenerate containers,
+    loci, and objects already on helper_class are routed into a separate named
+    helper group. Returns a plan_id + confirm_token without mutating the file.
+    """
+    p: Dict[str, Any] = {
+        "layer": layer, "assembly_name": assembly_name,
+        "expected_model_count": expected_model_count,
+        "target_floor": target_floor, "helper_class": helper_class,
+        "tolerance": tolerance,
+    }
+    if helper_name: p["helper_name"] = helper_name
+    return cmd("plan_normalize_assembly", p)
+
+@vtool
+def execute_normalize_assembly(ctx: Context, plan_id: str,
+                               confirm_token: str,
+                               save_checkpoint: bool = True) -> str:
+    """Execute/finalize a normalization plan across two MCP calls.
+
+    First call groups/names/moves the assembly and helpers. Repeat in a NEW
+    MCP call after Vectorworks regeneration to restore Structural Member
+    matrices, then call verify_normalize_assembly.
+    """
+    return cmd("execute_normalize_assembly",
+               {"plan_id": plan_id, "confirm_token": confirm_token,
+                "save_checkpoint": save_checkpoint})
+
+@vtool
+def verify_normalize_assembly(ctx: Context, plan_id: str) -> str:
+    """Fresh post-regeneration verification of grouping, naming, PIOs, and floor."""
+    return cmd("verify_normalize_assembly", {"plan_id": plan_id})
+
+@vtool
+def assembly_floor_report(ctx: Context, assembly_names: List[str],
+                          target_floor: float = 0.0,
+                          tolerance: float = 0.01) -> str:
+    """Read-only common-floor QA for named top-level assembly containers."""
+    return cmd("assembly_floor_report",
+               {"assembly_names": assembly_names, "target_floor": target_floor,
+                "tolerance": tolerance})
+
+@vtool
+def assembly_qa_bundle(ctx: Context, layer: str,
+                       assembly_names: Optional[List[str]] = None,
+                       expected_manifest_count: Optional[int] = None,
+                       region: Optional[Dict[str, float]] = None,
+                       roles: Optional[List[str]] = None,
+                       profiles: Optional[List[str]] = None,
+                       name_prefix: Optional[str] = None,
+                       target_floor: float = 0.0,
+                       tolerance: float = 0.01,
+                       include_objects: bool = False,
+                       limit: int = 1000, guard: int = 60000) -> str:
+    """One-round-trip assembly manifest + count + common-floor QA."""
+    p: Dict[str, Any] = {
+        "layer": layer, "assembly_names": assembly_names or [],
+        "target_floor": target_floor, "tolerance": tolerance,
+        "include_objects": include_objects, "limit": limit, "guard": guard,
+    }
+    if expected_manifest_count is not None:
+        p["expected_manifest_count"] = expected_manifest_count
+    if region: p["region"] = region
+    if roles: p["roles"] = roles
+    if profiles: p["profiles"] = profiles
+    if name_prefix: p["name_prefix"] = name_prefix
+    return cmd("assembly_qa_bundle", p)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Object Manipulation
@@ -630,6 +949,166 @@ def set_object_class(ctx: Context, object_id: str, obj_class: str) -> str:
 def set_object_name(ctx: Context, object_id: str, name: str) -> str:
     """Set object name"""
     return cmd("set_object_name", {"object_id": object_id, "name": name})
+
+@vtool
+def place_member_between_faces(ctx: Context, profile_source_id: str,
+                               axis: str, face_a: float, face_b: float,
+                               transverse: float, elevation: float,
+                               side_offset: float = 0.0,
+                               name: Optional[str] = None,
+                               layer: Optional[str] = None,
+                               obj_class: Optional[str] = None,
+                               tolerance: float = 0.01) -> str:
+    """Duplicate an axis-aligned Structural Member between two physical faces.
+
+    `axis` is x or y; face_a/face_b are world coordinates on that axis;
+    transverse is the other world coordinate; elevation is center Z. Equal PIO
+    start/end-offset changes preserve center, and the result is read back before
+    it is kept. The source must already be parallel to the requested axis.
+    """
+    p: Dict[str, Any] = {
+        "profile_source_id": profile_source_id, "axis": axis,
+        "face_a": face_a, "face_b": face_b, "transverse": transverse,
+        "elevation": elevation, "side_offset": side_offset,
+        "tolerance": tolerance,
+    }
+    if name: p["name"] = name
+    if layer: p["layer"] = layer
+    if obj_class is not None: p["class"] = obj_class
+    return cmd("place_member_between_faces", p)
+
+@vtool
+def place_member_between_faces_guarded(
+        ctx: Context, profile_source_id: str,
+        axis: str, face_a: float, face_b: float,
+        transverse: float, elevation: float,
+        side_offset: float = 0.0,
+        name: Optional[str] = None,
+        layer: Optional[str] = None,
+        obj_class: Optional[str] = None,
+        tolerance: float = 0.01,
+        allow_native_box_fallback: bool = True,
+        fallback_keywords: Optional[List[str]] = None) -> str:
+    """Guarded multi-dispatch Structural Member placement.
+
+    Internally performs provisional create → regeneration barrier → matrix
+    persistence → fresh dimensions/parent/generated-child verification. A failed
+    solid strap/plate/flat-bar PIO is removed and replaced with a freshly verified
+    native extrude when fallback is enabled. Complex/hollow profiles never silently
+    become boxes. Leaves the successful result dirty for visual QA + final save.
+    """
+    p: Dict[str, Any] = {
+        "profile_source_id": profile_source_id, "axis": axis,
+        "face_a": face_a, "face_b": face_b, "transverse": transverse,
+        "elevation": elevation, "side_offset": side_offset,
+        "tolerance": tolerance,
+        "allow_native_box_fallback": allow_native_box_fallback,
+    }
+    if name: p["name"] = name
+    if layer: p["layer"] = layer
+    if obj_class is not None: p["class"] = obj_class
+    if fallback_keywords: p["fallback_keywords"] = fallback_keywords
+    return json.dumps(_guarded_member_placement(p), indent=2)
+
+@vtool
+def create_verified_native_boxes(
+        ctx: Context, items: List[Dict[str, Any]],
+        expected_count: Optional[int] = None,
+        layer: Optional[str] = None,
+        obj_class: Optional[str] = None,
+        material_name: Optional[str] = None,
+        texture_name: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        assembly_names: Optional[List[str]] = None,
+        expected_model_count_after: Optional[int] = None,
+        target_floor: float = 0.0,
+        require_clean_floor: bool = False,
+        tolerance: float = 0.01,
+        confirm: bool = False) -> str:
+    """Create/style/parent/verify a native-box batch in one round-trip.
+
+    Additive and fail-closed. Each item accepts corner x/y/z +
+    width/depth/height or center{x,y,z} + dimensions{x,y,z}. Pass confirm=true
+    to mutate; otherwise returns the normalized dry-run plan. Any failed
+    creation/readback/count/floor check rolls back the whole batch.
+    """
+    p: Dict[str, Any] = {
+        "items": items, "target_floor": target_floor,
+        "require_clean_floor": require_clean_floor,
+        "tolerance": tolerance, "confirm": confirm,
+    }
+    if expected_count is not None: p["expected_count"] = expected_count
+    if layer: p["layer"] = layer
+    if obj_class is not None: p["class"] = obj_class
+    if material_name: p["material_name"] = material_name
+    if texture_name: p["texture_name"] = texture_name
+    if parent_id: p["parent_id"] = parent_id
+    if assembly_names: p["assembly_names"] = assembly_names
+    if expected_model_count_after is not None:
+        p["expected_model_count_after"] = expected_model_count_after
+    return cmd("create_verified_native_boxes", p)
+
+@vtool
+def reconcile_verified_native_boxes(
+        ctx: Context, items: List[Dict[str, Any]],
+        layer: str, name_prefix: str,
+        expected_count: Optional[int] = None,
+        obj_class: Optional[str] = None,
+        material_name: Optional[str] = None,
+        texture_name: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        prune: bool = False,
+        tolerance: float = 0.01,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Converge scoped named native boxes on a declarative desired state.
+
+    First call with confirm=false to receive the exact plan and plan_token.
+    Re-submit unchanged input with confirm=true and that token. The engine
+    creates missing boxes, moves/restyles changed boxes, additively replaces
+    dimension changes, and deletes scoped extras only when prune=true. It
+    re-reads the document before mutation and verifies convergence afterward.
+    """
+    p: Dict[str, Any] = {
+        "items": items, "layer": layer, "name_prefix": name_prefix,
+        "prune": prune, "tolerance": tolerance, "confirm": confirm,
+    }
+    if expected_count is not None: p["expected_count"] = expected_count
+    if obj_class is not None: p["class"] = obj_class
+    if material_name: p["material_name"] = material_name
+    if texture_name: p["texture_name"] = texture_name
+    if parent_id: p["parent_id"] = parent_id
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("reconcile_verified_native_boxes", p)
+
+@vtool
+def bulk_transform_objects(
+        ctx: Context, items: List[Dict[str, Any]],
+        expected_count: Optional[int] = None,
+        allowed_types: Optional[List[int]] = None,
+        assembly_names: Optional[List[str]] = None,
+        minimum_z: Optional[float] = None,
+        target_floor: float = 0.0,
+        require_clean_floor: bool = False,
+        tolerance: float = 0.01,
+        confirm: bool = False) -> str:
+    """Move many safe 3D leaf objects with readback and automatic rollback.
+
+    Each item is {object_id, target_center:{x?,y?,z?}} or
+    {object_id, delta:{x?,y?,z?}}. Groups and PIOs are rejected by default.
+    Dry-run until confirm=true. `minimum_z` directly guards every moved leaf;
+    require_clean_floor also uses target_floor as that minimum.
+    """
+    p: Dict[str, Any] = {
+        "items": items, "target_floor": target_floor,
+        "require_clean_floor": require_clean_floor,
+        "tolerance": tolerance, "confirm": confirm,
+    }
+    if expected_count is not None: p["expected_count"] = expected_count
+    if allowed_types: p["allowed_types"] = allowed_types
+    if assembly_names: p["assembly_names"] = assembly_names
+    if minimum_z is not None: p["minimum_z"] = minimum_z
+    return cmd("bulk_transform_objects", p)
 
 @vtool
 def group_objects(ctx: Context, object_ids: list) -> str:
@@ -794,6 +1273,350 @@ def set_3d_view(ctx: Context, view: str = "top") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Resources
+# ═══════════════════════════════════════════════════════════════════
+
+@vtool
+def find_library_resources(
+        ctx: Context, kind: str, name: str,
+        source_path: Optional[str] = None,
+        library_roots: Optional[List[str]] = None,
+        max_files: int = 700,
+        suggestion_limit: int = 8) -> str:
+    """Search external VWX libraries without importing.
+
+    Verified kinds are symbol, hatch, and texture. Pass source_path to search
+    one known file, or omit it to search the installed VW2026 libraries.
+    """
+    p: Dict[str, Any] = {
+        "kind": kind, "name": name, "max_files": max_files,
+        "suggestion_limit": suggestion_limit,
+    }
+    if source_path: p["source_path"] = source_path
+    if library_roots: p["library_roots"] = library_roots
+    return cmd("find_library_resources", p)
+
+@vtool
+def ensure_resources(
+        ctx: Context, items: List[Dict[str, Any]],
+        library_roots: Optional[List[str]] = None,
+        max_files: int = 700,
+        suggestion_limit: int = 8,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Ensure hatches/textures exist and resolve symbol library locations.
+
+    Each item is {kind, name, source_path?}. Existing same-type resources are
+    retained; missing resources are located in VWX libraries and imported only
+    after a dry-run plan_token is confirmed. Collisions and ambiguity fail closed.
+    Symbols are found and reported but require manual Resource Manager import:
+    both tested VW2026 symbol-import APIs open a blocking Untitled document.
+    """
+    p: Dict[str, Any] = {
+        "items": items, "max_files": max_files,
+        "suggestion_limit": suggestion_limit, "confirm": confirm,
+    }
+    if library_roots: p["library_roots"] = library_roots
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("ensure_resources", p)
+
+@vtool
+def ensure_project_standards(
+        ctx: Context, standard: Dict[str, Any],
+        allow_units_change: bool = False,
+        library_roots: Optional[List[str]] = None,
+        max_files: int = 700,
+        suggestion_limit: int = 8,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Converge safe project setup from one declarative standard manifest.
+
+    Supports units, layers, classes, resources, create-only Saved Views, and
+    create-only starter worksheets. Never deletes, renames, prunes, or overwrites
+    document structures. Dry-run first; confirm with its state-bound plan_token.
+    Unit changes additionally require allow_units_change=true. VW2026 has no safe
+    active-layer restore API in this bridge context, so the last newly created layer
+    remains active and is reported in the result.
+    """
+    p: Dict[str, Any] = {
+        "standard": standard, "allow_units_change": allow_units_change,
+        "max_files": max_files, "suggestion_limit": suggestion_limit,
+        "confirm": confirm,
+    }
+    if library_roots: p["library_roots"] = library_roots
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("ensure_project_standards", p)
+
+@vtool
+def ensure_drawing_package(
+        ctx: Context, package: Dict[str, Any],
+        tolerance: float = 0.01,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Compile a create-only drawing package from one declarative manifest.
+
+    Supports sheet layers, named plan/elevation/iso viewports with deterministic
+    layer/class visibility, explicit viewport-annotation dimensions, criteria-driven
+    report worksheets, and Saved Views. Dry-run first; confirm with the returned
+    state-bound plan_token. Never overwrites, renames, prunes, publishes, or exports.
+    """
+    p: Dict[str, Any] = {
+        "package": package, "tolerance": tolerance, "confirm": confirm,
+    }
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("ensure_drawing_package", p)
+
+@vtool
+def compile_vw_project(
+        ctx: Context, project: Dict[str, Any],
+        allow_units_change: bool = False,
+        library_roots: Optional[List[str]] = None,
+        max_files: int = 700,
+        suggestion_limit: int = 8,
+        tolerance: float = 0.01,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Run standards -> native-box geometry -> drawing package as one saga.
+
+    One outer state-bound token approves the full manifest. Each stage then uses
+    its own fresh inner plan/readback. Later failure returns status=partial and
+    preserves earlier verified stages. Geometry replacement and prune are refused.
+    """
+    p: Dict[str, Any] = {
+        "project": project, "allow_units_change": allow_units_change,
+        "max_files": max_files, "suggestion_limit": suggestion_limit,
+        "tolerance": tolerance, "confirm": confirm,
+    }
+    if library_roots: p["library_roots"] = library_roots
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("compile_vw_project", p)
+
+@vtool
+def list_assembly_templates(ctx: Context) -> str:
+    """List immutable versioned parametric assembly templates and schemas."""
+    return cmd("list_assembly_templates")
+
+@vtool
+def expand_assembly_template(
+        ctx: Context, template: str, parameters: Dict[str, Any],
+        max_items: int = 500) -> str:
+    """Pure expansion into deterministic project.geometry native-box items.
+
+    Writes nothing. Feed the returned geometry object to compile_vw_project.
+    """
+    return cmd("expand_assembly_template", {
+        "template": template, "parameters": parameters, "max_items": max_items})
+
+@vtool
+def semantic_object_search(
+        ctx: Context, layer: str, query: str = "",
+        filters: Optional[Dict[str, Any]] = None,
+        mode: str = "all", limit: int = 50,
+        candidate_limit: int = 500, guard: int = 60000) -> str:
+    """Rank named assembly geometry by semantic terms plus structured filters."""
+    return cmd("semantic_object_search", {
+        "layer": layer, "query": query, "filters": filters or {},
+        "mode": mode, "limit": limit, "candidate_limit": candidate_limit,
+        "guard": guard})
+
+@vtool
+def select_semantic_objects(
+        ctx: Context, layer: str, query: str = "",
+        filters: Optional[Dict[str, Any]] = None,
+        mode: str = "all", limit: int = 50,
+        candidate_limit: int = 500, replace: bool = True,
+        guard: int = 60000,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Token-gated selection from a fresh semantic search; geometry is untouched."""
+    p: Dict[str, Any] = {
+        "layer": layer, "query": query, "filters": filters or {},
+        "mode": mode, "limit": limit, "candidate_limit": candidate_limit,
+        "guard": guard, "replace": replace, "confirm": confirm,
+    }
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("select_semantic_objects", p)
+
+@vtool
+def index_document(
+        ctx: Context, layers: Optional[List[str]] = None,
+        limit: int = 2000, guard: int = 100000,
+        max_depth: int = 25, record_field_limit: int = 1000,
+        include_annotations: bool = True,
+        include_records: bool = True,
+        include_symbols: bool = True) -> str:
+    """Build a bounded semantic index of layers, nested objects, annotations, and records."""
+    return cmd("index_document", {
+        "layers": layers, "limit": limit, "guard": guard,
+        "max_depth": max_depth, "record_field_limit": record_field_limit,
+        "include_annotations": include_annotations, "include_records": include_records,
+        "include_symbols": include_symbols})
+
+@vtool
+def search_document(
+        ctx: Context, query: str = "",
+        filters: Optional[Dict[str, Any]] = None,
+        layers: Optional[List[str]] = None,
+        limit: int = 100, index_limit: int = 2000,
+        guard: int = 100000, max_depth: int = 25,
+        include_annotations: bool = True,
+        include_records: bool = True,
+        include_symbols: bool = True) -> str:
+    """Semantic search over a fresh universal document index."""
+    return cmd("search_document", {
+        "query": query, "filters": filters or {}, "layers": layers,
+        "limit": limit, "index_limit": index_limit, "guard": guard,
+        "max_depth": max_depth, "include_annotations": include_annotations,
+        "include_records": include_records, "include_symbols": include_symbols})
+
+@vtool
+def compile_document_changes(
+        ctx: Context, change_set: Dict[str, Any],
+        allow_destructive: bool = False,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Token-gated staged compiler for safe object, native-box, drawing, and delete changes."""
+    p: Dict[str, Any] = {"change_set": change_set,
+                         "allow_destructive": allow_destructive,
+                         "confirm": confirm}
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("compile_document_changes", p)
+
+@vtool
+def plan_auto_dimensions(
+        ctx: Context, layer: str, name_prefix: str, viewport: str,
+        plane: str = "plan",
+        rules: Optional[List[str]] = None,
+        center_axis: Optional[str] = None,
+        tolerance: float = 0.01,
+        offset: float = 6.0,
+        spacing: float = 3.0,
+        limit: int = 100) -> str:
+    """Read-only dimension derivation for named axis-aligned geometry.
+
+    Rules: overall, centers, members, contacts. Returns deterministic explicit
+    package.dimensions rows consumable by ensure_drawing_package; writes nothing.
+    """
+    p: Dict[str, Any] = {
+        "layer": layer, "name_prefix": name_prefix, "viewport": viewport,
+        "plane": plane, "rules": rules or ["overall"],
+        "tolerance": tolerance, "offset": offset,
+        "spacing": spacing, "limit": limit,
+    }
+    if center_axis: p["center_axis"] = center_axis
+    return cmd("plan_auto_dimensions", p)
+
+@vtool
+def sync_drawing_package(
+        ctx: Context, package: Optional[Dict[str, Any]] = None,
+        dimension_scopes: Optional[List[Dict[str, Any]]] = None,
+        supersede_dimension_names: Optional[List[str]] = None,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Derive dimensions, converge drawings, and safely retire explicit stale dimensions."""
+    p: Dict[str, Any] = {
+        "package": package or {}, "dimension_scopes": dimension_scopes or [],
+        "supersede_dimension_names": supersede_dimension_names or [],
+        "confirm": confirm,
+    }
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("sync_drawing_package", p)
+
+@vtool
+def compile_drawing_set(
+        ctx: Context, drawing_set: Dict[str, Any],
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Build sheets, standard viewports, dimensions, reports, and QA view from one spec."""
+    p: Dict[str, Any] = {"drawing_set": drawing_set, "confirm": confirm}
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("compile_drawing_set", p)
+
+@vtool
+def get_revision_snapshot(
+        ctx: Context,
+        domains: Optional[List[str]] = None,
+        layer: Optional[str] = None,
+        name_prefix: Optional[str] = None,
+        geometry_scopes: Optional[List[Dict[str, str]]] = None,
+        resource_targets: Optional[List[Dict[str, Any]]] = None,
+        report_names: Optional[List[str]] = None,
+        quantum: float = 0.001,
+        geometry_limit: int = 500,
+        max_cells: int = 1000,
+        drawing_limit: int = 100,
+        visibility_limit: int = 20000,
+        structure_limit: int = 1000,
+        guard: int = 60000) -> str:
+    """Read deterministic geometry/structure/drawing/report state as JSON."""
+    p: Dict[str, Any] = {"domains": domains or ["structure", "drawing"],
+                         "quantum": quantum, "geometry_limit": geometry_limit,
+                         "max_cells": max_cells, "drawing_limit": drawing_limit,
+                         "visibility_limit": visibility_limit,
+                         "structure_limit": structure_limit, "guard": guard}
+    if layer: p["layer"] = layer
+    if name_prefix: p["name_prefix"] = name_prefix
+    if geometry_scopes: p["geometry_scopes"] = geometry_scopes
+    if resource_targets: p["resource_targets"] = resource_targets
+    if report_names: p["report_names"] = report_names
+    return cmd("get_revision_snapshot", p)
+
+@vtool
+def manage_revision_baseline(
+        ctx: Context, action: str = "list",
+        name: Optional[str] = None,
+        snapshot: Optional[Dict[str, Any]] = None) -> str:
+    """Store/list/get/forget create-only file-backed revision baselines."""
+    p: Dict[str, Any] = {"action": action}
+    if name: p["name"] = name
+    if snapshot: p["snapshot"] = snapshot
+    return cmd("manage_revision_baseline", p)
+
+@vtool
+def qa_autopilot(
+        ctx: Context, layers: Optional[List[str]] = None,
+        temporary_prefixes: Optional[List[str]] = None,
+        dimension_expectations: Optional[List[Dict[str, Any]]] = None,
+        baseline_name: Optional[str] = None,
+        revision_snapshot: Optional[Dict[str, Any]] = None,
+        require_clean_selection: bool = True,
+        clear_selection: bool = True,
+        save: bool = False,
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Bounded state QA with annotation readback; optionally clear selection and save."""
+    p: Dict[str, Any] = {
+        "layers": layers, "temporary_prefixes": temporary_prefixes or ["MCP-", "TMP-"],
+        "dimension_expectations": dimension_expectations or [],
+        "require_clean_selection": require_clean_selection,
+        "clear_selection": clear_selection, "save": save, "confirm": confirm,
+    }
+    if baseline_name: p["baseline_name"] = baseline_name
+    if revision_snapshot: p["revision_snapshot"] = revision_snapshot
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("qa_autopilot", p)
+
+@vtool
+def get_revision_diff(
+        ctx: Context, current: Dict[str, Any],
+        baseline: Optional[Dict[str, Any]] = None,
+        baseline_name: Optional[str] = None) -> str:
+    """Diff matching deterministic revision snapshots; read-only."""
+    p: Dict[str, Any] = {"current": current}
+    if baseline: p["baseline"] = baseline
+    if baseline_name: p["baseline_name"] = baseline_name
+    return cmd("get_revision_diff", p)
+
+@vtool
+def ensure_revision_report(
+        ctx: Context, name: str, diff: Dict[str, Any],
+        plan_token: Optional[str] = None,
+        confirm: bool = False) -> str:
+    """Create-only static worksheet from a revision diff; never overwrite."""
+    p: Dict[str, Any] = {"name": name, "diff": diff, "confirm": confirm}
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("ensure_revision_report", p)
+
 # Symbols
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1071,10 +1894,19 @@ def get_viewports(ctx: Context) -> str:
 
 @vtool
 def create_viewport(ctx: Context, sheet_layer: str, x: float, y: float,
-                    scale: float, design_layers: list = None) -> str:
-    """Create a viewport on a sheet layer. Returns object id."""
+                    scale: float, design_layers: list = None,
+                    name: str = None, projection: int = None,
+                    view_type: int = None) -> str:
+    """Create a viewport directly under an existing sheet layer.
+
+    Optional projection/view_type are raw VW viewport selectors. Prefer
+    ensure_drawing_package for named plan/elevation/iso viewports.
+    """
     p = {"sheet_layer": sheet_layer, "x": x, "y": y, "scale": scale}
     if design_layers: p["design_layers"] = design_layers
+    if name: p["name"] = name
+    if projection is not None: p["projection"] = projection
+    if view_type is not None: p["view_type"] = view_type
     return cmd("create_viewport", p)
 
 @vtool
@@ -1146,6 +1978,14 @@ def export_image(ctx: Context, path: str, width: int = 2000, height: int = 1500,
                                 "dpi": dpi, "format": format})
 
 @vtool
+def export_stl(ctx: Context, path: str, binary: bool = True,
+               tessellation: float = 50.0, scope: str = "selected") -> str:
+    """Export STL headlessly to an absolute path. scope: selected, active_layer,
+    or all. tessellation: 0 (low) to 100 (high)."""
+    return cmd("export_stl", {"path": path, "binary": binary,
+                              "tessellation": tessellation, "scope": scope})
+
+@vtool
 def import_dwg(ctx: Context, path: str, layer: str = None) -> str:
     """Import a DWG/DXF file into the current document"""
     p = {"path": path}
@@ -1191,6 +2031,20 @@ def set_zoom(ctx: Context, percent: float) -> str:
 def refresh_view(ctx: Context) -> str:
     """Force screen refresh"""
     return cmd("refresh_view")
+
+@vtool
+def save_qa_view(ctx: Context, name: str, save_view: bool = True,
+                 save_classes: bool = True, save_layers: bool = True,
+                 replace: bool = True) -> str:
+    """Save current view plus layer/class visibility as a named QA Saved View."""
+    return cmd("save_qa_view", {"name": name, "save_view": save_view,
+                                "save_classes": save_classes,
+                                "save_layers": save_layers, "replace": replace})
+
+@vtool
+def restore_qa_view(ctx: Context, name: str) -> str:
+    """Restore a named Vectorworks QA Saved View."""
+    return cmd("restore_qa_view", {"name": name})
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1258,10 +2112,16 @@ def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None) -> 
     return cmd(command, params or {})
 
 @vtool
-def vwx_batch(ctx: Context, calls: List[Dict[str, Any]]) -> str:
-    """Run multiple VWX commands in one round-trip (saves socket + main-thread trips).
-    calls: [{'command': str, 'params': dict}, ...]. Returns list of results in order."""
-    return cmd("_batch", {"calls": calls})
+def vwx_batch(ctx: Context, calls: List[Dict[str, Any]],
+              fail_fast: bool = False) -> str:
+    """Run multiple VWX commands in one round-trip.
+
+    Later params can consume earlier results with {"$ref":"0.object_id"}.
+    `fail_fast` stops after the first reference/dispatch/command error. This is
+    orchestration, not an atomic transaction; use guarded compound commands
+    when rollback is required.
+    """
+    return cmd("_batch", {"calls": calls, "fail_fast": fail_fast})
 
 @vtool
 def list_commands(ctx: Context, filter: Optional[str] = None) -> str:
@@ -1902,7 +2762,8 @@ def get_materials(ctx: Context, layers: Optional[List[str]] = None, guard: int =
 @vtool
 def set_projection(ctx: Context, projection: int = 0, render_mode: int = 0,
                    view_distance: float = 0, clip1: float = 0, clip2: float = 0) -> str:
-    """Set view projection (0=orthogonal, 1=perspective; VW codes) + render mode code."""
+    """Guarded legacy surface; VW2026's Python Projection callback is disabled
+    because every tested signature opens Script Errors. Use set_3d_view."""
     return cmd("set_projection", {"projection": projection, "render_mode": render_mode,
                                   "view_distance": view_distance, "clip1": clip1, "clip2": clip2})
 
@@ -2004,6 +2865,16 @@ def assign_material(ctx: Context, object_id: str, material_name: str) -> str:
 def list_components(ctx: Context, object_id: str) -> str:
     """List wall/slab/roof components with width, class, function, net area/volume."""
     return cmd("list_components", {"object_id": object_id})
+
+@vtool
+def edit_components(ctx: Context, object_id: str,
+                    updates: List[Dict[str, Any]],
+                    plan_token: Optional[str] = None,
+                    confirm: bool = False) -> str:
+    """Token-gated edits to existing wall/slab/roof component semantic fields."""
+    p: Dict[str, Any] = {"object_id": object_id, "updates": updates, "confirm": confirm}
+    if plan_token: p["plan_token"] = plan_token
+    return cmd("edit_components", p)
 
 @vtool
 def insert_component(ctx: Context, object_id: str, before_index: int = 1,
@@ -2191,11 +3062,16 @@ def _init_otel():
 def main():
     _init_otel()
     # Optional toolset filtering via the fastmcp Visibility API.
-    # VWX_TOOLSET=gis|modeling|baumkataster|minimal|full (default full = no filter).
-    from tool_tags import preset_tags
+    # VWX_TOOLSET=mechanical|gis|modeling|baumkataster|minimal|full.
+    # Exact-name presets are checked first; broad presets continue to use tags.
+    from tool_tags import preset_names, preset_tags
     sel = os.environ.get("VWX_TOOLSET", "full")
+    names = preset_names(sel)
     tags = preset_tags(sel)
-    if tags:
+    if names:
+        mcp.enable(names=names, only=True)
+        logger.info(f"VWX_TOOLSET={sel}: limited to {len(names)} explicit tools")
+    elif tags:
         mcp.enable(tags=tags, only=True)
         logger.info(f"VWX_TOOLSET={sel}: limited to tags {sorted(tags)}")
 

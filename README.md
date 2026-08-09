@@ -1,6 +1,6 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 248 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
+**Vectorworks 2026 MCP server — 290 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
 
 Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
@@ -94,34 +94,55 @@ path.
 
 ## Toolset presets (tame tool-overload)
 
-248 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
+290 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
 `bridge/vwx-mcp.bat` to expose only one workflow's tools via the fastmcp
 Visibility API (tags live in `mcp-server/tool_tags.py`):
 
 | `VWX_TOOLSET` | tools | for |
 |---|---|---|
-| `full` (default) | 248 | everything |
-| `gis` | 101 | georef / layers / classes / appearance / export |
-| `modeling` | 160 | 2D+3D draw / manipulate / BIM / symbols |
-| `baumkataster` | 70 | tree register: plants / records / query / IO |
-| `minimal` | 40 | document / query / escape hatch |
+| `full` (default) | 290 | everything |
+| `mechanical` | 78 | focused inspect / model / transform / QA surface with escape hatches |
+| `gis` | 111 | georef / layers / classes / appearance / export |
+| `modeling` | 179 | 2D+3D draw / manipulate / BIM / symbols |
+| `baumkataster` | 80 | tree register: plants / records / query / IO |
+| `minimal` | 49 | document / query / escape hatch |
 
-## Tools (248)
+The `mechanical` preset is an exact-name allowlist; the broader presets select
+whole tags. On a mechanical workstation, set `VWX_TOOLSET=mechanical` and use
+`vwx` / `vwx_batch` / `execute_script` for rare verbs outside the 78 schemas.
 
-19 tag groups — counts in parentheses:
+## Latency regression check
 
-`bim` (31, incl. IFC deep: psets, bulk classification, walls, roofs) ·
-`manipulate` (26, incl. polygon vertex editing) · `worksheets` (23, incl.
-criteria-driven report generation) · `query` (21, incl. the criteria engine) ·
-`draw3d` (19, incl. loft / shell / path-extrude / NURBS) · `draw2d` (18, incl.
+With Vectorworks and the pump watcher running:
+
+```bash
+.venv/bin/python tools/benchmark_latency.py
+.venv/bin/python tools/benchmark_latency.py --record-baseline  # deliberately accept a new baseline
+```
+
+The source-safe benchmark measures `ping` and `get_document_info` twice: direct
+file IPC, then end-to-end through a temporary 78-tool FastMCP streamable-HTTP
+server. It reports MCP framing overhead and fails when median or p95 exceeds
+both the tracked baseline ratio and a practical noise floor. Use `--mode ipc`
+to isolate the watcher/VW path.
+
+## Tools (290)
+
+20 tag groups — counts in parentheses:
+
+`bim` (32, incl. IFC deep: psets, bulk classification, walls, roofs, guarded component editing) ·
+`manipulate` (34, incl. guarded assembly transforms and declarative native-box reconciliation) · `worksheets` (23, incl.
+criteria-driven report generation) · `query` (29, incl. assembly QA) ·
+`draw3d` (20, incl. loft / shell / path-extrude / NURBS) · `draw2d` (18, incl.
 surface booleans) · `appearance` (23, incl. textures + lights) · `layers` (11) ·
-`document` (10, incl. doc-default styling) · `escape` (9, incl. `vs_signature`) ·
+`document` (21, incl. project compiler, compact drawing sets, templates, auto-dimension, and revision engine) · `escape` (9, incl. `vs_signature`) ·
+`resources` (3, library search, guarded import, and declarative project standards) ·
 `geo` (7, incl. lat/lon ⇄ drawing conversion + EPSG georef) · `classes` (7) ·
 `records` (7) · `viewports` (7) · `symbols` (6) · `landscape` (6, Baumkataster) ·
-`io` (6) · `view` (6) · `site` (5)
+`io` (7) · `view` (8) · `site` (5)
 
 Three access layers (see [AGENTS.md](AGENTS.md)):
-1. **Explicit tools** — the 248 wrappers above.
+1. **Explicit tools** — the 290 wrappers above.
 2. **`vwx(command, params)`** — generic dispatcher reaching every verb in
    `commands.py` (use `list_commands` to discover).
 3. **`execute_script`** — arbitrary `vs.*` Python.
