@@ -40,6 +40,14 @@ class FastCompoundWorkflowTests(unittest.TestCase):
         self.assertEqual(rows[0]["z"], 27.0)
         self.assertEqual(rows[0]["target_center"], {"x": 10.0, "y": 20.0, "z": 30.0})
 
+    def test_assembly_manifest_keeps_solid_loft_parts(self):
+        self.assertTrue(self.commands._is_assembly_leaf_part("", "", 84))
+        self.assertEqual(self.commands.OBJ_TYPES[84], "solid_loft")
+        self.assertEqual(
+            self.commands._assembly_role("", "", 84, {"x": 22, "y": 89, "z": 3}),
+            "part",
+        )
+
     def test_box_specs_reject_count_and_name_collisions(self):
         rows, error = self.commands._normalize_native_box_specs({
             "expected_count": 2,

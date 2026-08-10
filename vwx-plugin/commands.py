@@ -91,7 +91,7 @@ OBJ_TYPES = {
     2:'line',3:'rect',4:'oval',5:'polyline',6:'bezier',8:'arc',
     9:'freehand',11:'group',12:'symbol_def',15:'symbol',21:'polygon',
     24:'extrude',25:'solid',26:'sweep',28:'sphere',34:'wall',40:'mesh',
-    68:'plugin_obj_legacy',86:'plugin_obj',89:'viewport',91:'nurbs',94:'worksheet'
+    68:'plugin_obj_legacy',84:'solid_loft',86:'plugin_obj',89:'viewport',91:'nurbs',94:'worksheet'
 }
 
 def _summary(h):
@@ -1138,6 +1138,9 @@ def _assembly_role(profile, symbol_name, obj_type, dims, units_per_inch=1.0):
     if 'pr, prt' in text: return 'caster'
     if 'assembly~2_defintion' in text: return 'figure'
     if 'crate' in text or 'group#153' in text: return 'crate'
+    # Lofted upholstery and other type-84 solids are terminal custom parts,
+    # not lumber; their proportions can otherwise misclassify them as tubes.
+    if obj_type == 84: return 'part'
     if dims:
         ordered = sorted(dims.values())
         thin = 0.2 * units_per_inch
@@ -1151,6 +1154,10 @@ def _assembly_role(profile, symbol_name, obj_type, dims, units_per_inch=1.0):
     if obj_type == 15: return 'symbol'
     if profile: return 'structural_member'
     return 'part'
+
+
+def _is_assembly_leaf_part(profile, symbol_name, obj_type):
+    return bool(profile or symbol_name or obj_type in (24, 40, 68, 84, 86))
 
 
 def get_assembly_manifest(p):
@@ -1243,7 +1250,10 @@ def get_assembly_manifest(p):
             if not simple_mesh_candidate(dims):
                 return None
 
-        is_leaf_part = bool(profile or symbol_name or t in (24, 40, 86, 68))
+        # Type 84 is a solid NURBS/CSG result (for example CreateLoftSurfaces
+        # with solid=True). It is a terminal part with reliable Get3DCntr /
+        # Get3DInfo readback and must not disappear from revision snapshots.
+        is_leaf_part = _is_assembly_leaf_part(profile, symbol_name, t)
         if not is_leaf_part:
             return None
         center = _center3(h)

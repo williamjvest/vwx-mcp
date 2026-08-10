@@ -124,6 +124,15 @@ Live-testing findings (all reproduced):
   `BeginGroup()` → per section: create curve → `nh = ConvertToNURBS(c, False)` →
   `Move3DObj(nh, 0, 0, z)` → `EndGroup()` → `LNewObj()` is the group. Loft of
   three circles at z=0/80/160 → type-84 solid, depth = z-span.
+  `CreateLoftSurfaces` does **not** consume the source group; delete that group
+  explicitly after a successful loft. Failed/disposable tests must also audit
+  the active layer for leaked unnamed type-111 section curves.
+- **Type-84 solid lofts are assembly leaves.** `get_assembly_manifest` and
+  `get_revision_snapshot` include named type-84 solids using `Get3DCntr` and
+  `Get3DInfo`; omitting 84 silently produced an empty geometry snapshot before
+  the KitchenNook upholstery fix. The first comparison against a baseline made
+  before this support lands will correctly report those formerly omitted solids
+  as additions; store a fresh baseline after confirming them.
 - **`create_extrude_along_path`**: profile and path must NOT be coplanar
   (degenerate sweep → nil). Use a 3D path (`BeginPoly3D`/`Add3DPt`) rising out
   of the profile plane; the verb returns a clear error for the coplanar case.
