@@ -1,20 +1,8 @@
 """Tool tag taxonomy + workflow presets for vwx-mcp.
 
-Foundation for the FastMCP 3.x Visibility API (mcp.enable/disable(tags=...)).
-NOT yet wired into vwx_mcp_server.py — that happens in migration phase P2,
-after the bundled -> standalone fastmcp swap (see docs/MIGRATION_fastmcp3.md).
-
-Until then this is a reviewable, testable single source of truth: every one of
-the 150 @mcp.tool verbs maps to exactly one primary tag. Presets select which
-tags load for a given workflow, cutting tool-overload token cost.
-
-Wiring sketch (P2), in vwx_mcp_server.py main():
-
-    from tool_tags import preset_tags
-    import os
-    sel = os.environ.get("VWX_TOOLSET", "full")
-    if sel != "full":
-        mcp.enable(tags=preset_tags(sel), only=True)
+Canonical taxonomy for the wired FastMCP Visibility API. Every explicit MCP
+tool maps to one primary tag; `main()` applies `VWX_TOOLSET` through
+`mcp.enable(..., only=True)` so workflow presets reduce tool-schema overhead.
 """
 
 # tool name -> primary tag (mirrors the section banners in vwx_mcp_server.py)
