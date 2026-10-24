@@ -51,13 +51,38 @@ class LatencyBenchmarkTests(unittest.TestCase):
         }}
         self.assertEqual(BENCH.regressions(current, baseline, 1.35), [])
 
-    def test_regression_flags_toolset_drift(self):
+    def test_regression_flags_toolset_drift_when_toolsets_match(self):
+        # Drift is only flagged when both snapshots name the same toolset.
+        baseline = {"paths": {"mcp_http": {
+            "toolset": "mechanical", "tool_count": 78,
+            "cases": {"ping": {"median_ms": 100, "p95_ms": 200}},
+        }}}
+        current = {"paths": {"mcp_http": {
+            "toolset": "mechanical", "tool_count": 79,
+            "cases": {"ping": {"median_ms": 100, "p95_ms": 200}},
+        }}}
+        self.assertEqual(len(BENCH.regressions(current, baseline, 1.35)), 1)
+
+    def test_regression_ignores_toolset_drift_when_toolset_differs(self):
+        # A baseline recorded under one preset must not fail a run under another.
+        baseline = {"paths": {"mcp_http": {
+            "toolset": "mechanical", "tool_count": 78,
+            "cases": {"ping": {"median_ms": 100, "p95_ms": 200}},
+        }}}
+        current = {"paths": {"mcp_http": {
+            "toolset": "interior", "tool_count": 115,
+            "cases": {"ping": {"median_ms": 100, "p95_ms": 200}},
+        }}}
+        self.assertEqual(BENCH.regressions(current, baseline, 1.35), [])
+
+    def test_regression_ignores_toolset_drift_when_baseline_has_no_toolset(self):
+        # Old baselines (pre-toolset field) must not permanently fail.
         baseline = {"paths": {"mcp_http": {
             "tool_count": 56,
             "cases": {"ping": {"median_ms": 100, "p95_ms": 200}},
         }}}
         current = {"paths": {"mcp_http": {
-            "tool_count": 57,
+            "toolset": "mechanical", "tool_count": 78,
             "cases": {"ping": {"median_ms": 100, "p95_ms": 200}},
         }}}
-        self.assertEqual(len(BENCH.regressions(current, baseline, 1.35)), 1)
+        self.assertEqual(BENCH.regressions(current, baseline, 1.35), [])

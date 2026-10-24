@@ -1,6 +1,6 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 290 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
+**Vectorworks 2026 MCP server — 291 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
 
 Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
@@ -94,14 +94,15 @@ path.
 
 ## Toolset presets (tame tool-overload)
 
-290 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
+291 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
 `bridge/vwx-mcp.bat` to expose only one workflow's tools via the fastmcp
 Visibility API (tags live in `mcp-server/tool_tags.py`):
 
 | `VWX_TOOLSET` | tools | for |
 |---|---|---|
-| `full` (default) | 290 | everything |
+| `full` (default) | 291 | everything |
 | `mechanical` | 78 | focused inspect / model / transform / QA surface with escape hatches |
+| `interior` | 142 | spaces / walls / casework solids / finishes / schedules / viewports |
 | `gis` | 111 | georef / layers / classes / appearance / export |
 | `modeling` | 179 | 2D+3D draw / manipulate / BIM / symbols |
 | `baumkataster` | 80 | tree register: plants / records / query / IO |
@@ -126,7 +127,7 @@ server. It reports MCP framing overhead and fails when median or p95 exceeds
 both the tracked baseline ratio and a practical noise floor. Use `--mode ipc`
 to isolate the watcher/VW path.
 
-## Tools (290)
+## Tools (291)
 
 20 tag groups — counts in parentheses:
 
@@ -142,7 +143,7 @@ surface booleans) · `appearance` (23, incl. textures + lights) · `layers` (11)
 `io` (7) · `view` (8) · `site` (5)
 
 Three access layers (see [AGENTS.md](AGENTS.md)):
-1. **Explicit tools** — the 290 wrappers above.
+1. **Explicit tools** — the 291 wrappers above.
 2. **`vwx(command, params)`** — generic dispatcher reaching every verb in
    `commands.py` (use `list_commands` to discover).
 3. **`execute_script`** — arbitrary `vs.*` Python.

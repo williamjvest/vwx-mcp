@@ -56,6 +56,8 @@ _STAMP   = os.path.join(_IPC, 'pump.stamp')
 _LOG     = os.path.join(_DIR, 'bridge.log')
 
 RESULT_TTL = 3600.0          # orphaned result files are removed after this
+_LOG_MAX_BYTES = 2 * 1024 * 1024   # rotate bridge.log at 2 MB
+_LOG_KEEP_BYTES = 512 * 1024       # keep last 512 KB after rotation
 
 # Read-only commands: safe in ANY context (no document mutation, no dialog).
 # A job is read-only if its command is in this set OR starts with one of the
@@ -76,8 +78,30 @@ _UNSAVED_ALLOWED = frozenset()
 _FIRE_AND_FORGET = frozenset({'marionette_recalc'})
 
 
+def _rotate_log():
+    """Trim bridge.log to _LOG_KEEP_BYTES when it exceeds _LOG_MAX_BYTES."""
+    try:
+        size = os.path.getsize(_LOG)
+        if size <= _LOG_MAX_BYTES:
+            return
+        with open(_LOG, 'rb') as f:
+            f.seek(-_LOG_KEEP_BYTES, 2)
+            tail = f.read()
+        # Trim to a clean line boundary so lines are never split.
+        nl = tail.find(b'\n')
+        if nl != -1:
+            tail = tail[nl + 1:]
+        tmp = _LOG + '.tmp'
+        with open(tmp, 'wb') as f:
+            f.write(tail)
+        os.replace(tmp, _LOG)
+    except Exception:
+        pass
+
+
 def _log(msg):
     try:
+        _rotate_log()
         with open(_LOG, 'a', encoding='utf-8') as f:
             f.write("[%s] pump: %s\n" % (time.strftime('%H:%M:%S'), msg))
     except Exception:

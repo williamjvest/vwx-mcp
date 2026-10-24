@@ -139,16 +139,17 @@ def wait_for_port(host: str, port: int, process: subprocess.Popen, timeout: floa
 
 
 @contextmanager
-def mcp_http_server(base: Path, port: int, timeout: float):
+def mcp_http_server(base: Path, port: int, timeout: float, toolset: str | None = None):
     host = "127.0.0.1"
     env = os.environ.copy()
+    active_toolset = toolset or os.environ.get("VWX_TOOLSET", "mechanical")
     env.update({
         "MCP_TRANSPORT": "streamable-http",
         "FASTMCP_HOST": host,
         "FASTMCP_PORT": str(port),
         "VWX_TRANSPORT": "file",
         "VWX_PLUGIN_DIR": str(base),
-        "VWX_TOOLSET": "mechanical",
+        "VWX_TOOLSET": active_toolset,
     })
     process = subprocess.Popen(
         [sys.executable, str(ROOT / "mcp-server" / "vwx_mcp_server.py")],
@@ -170,7 +171,8 @@ def mcp_http_server(base: Path, port: int, timeout: float):
             process.wait(timeout=3)
 
 
-async def run_mcp_suite(url: str, runs: int, warmup: int) -> dict[str, Any]:
+async def run_mcp_suite(url: str, runs: int, warmup: int,
+                        toolset: str) -> dict[str, Any]:
     try:
         from fastmcp import Client
     except ImportError as exc:
@@ -192,7 +194,7 @@ async def run_mcp_suite(url: str, runs: int, warmup: int) -> dict[str, Any]:
                 if index >= warmup:
                     samples.append(elapsed)
             results[case] = summarize(samples)
-    return {"tool_count": len(tools), "cases": results}
+    return {"toolset": toolset, "tool_count": len(tools), "cases": results}
 
 
 def add_overhead(result: dict[str, Any]) -> None:
@@ -224,11 +226,19 @@ def regressions(current: dict[str, Any], baseline: dict[str, Any], ratio: float)
             failures.append(f"{path}: missing from baseline")
             continue
         if "tool_count" in current_path and "tool_count" in baseline_path:
-            if current_path["tool_count"] != baseline_path["tool_count"]:
-                failures.append(
-                    f"{path} tool_count {current_path['tool_count']} != "
-                    f"baseline {baseline_path['tool_count']}"
-                )
+            # Only flag tool-count drift when both snapshots used the same
+            # named toolset. Different presets legitimately have different
+            # counts, and a baseline recorded before adding a new preset
+            # (no "toolset" key) is skipped rather than permanently failing.
+            current_toolset = current_path.get("toolset", "")
+            baseline_toolset = baseline_path.get("toolset", "")
+            if current_toolset and baseline_toolset and current_toolset == baseline_toolset:
+                if current_path["tool_count"] != baseline_path["tool_count"]:
+                    failures.append(
+                        f"{path} tool_count {current_path['tool_count']} != "
+                        f"baseline {baseline_path['tool_count']} "
+                        f"(toolset={current_toolset!r})"
+                    )
         for case, now in current_path["cases"].items():
             before = baseline_path.get("cases", {}).get(case)
             if not before:
@@ -266,9 +276,10 @@ def main() -> int:
             FileIPC(base, timeout=args.timeout), args.runs, args.warmup
         )
     if args.mode in ("mcp", "both"):
-        with mcp_http_server(base, args.port, args.timeout) as url:
+        active_toolset = os.environ.get("VWX_TOOLSET", "mechanical")
+        with mcp_http_server(base, args.port, args.timeout, toolset=active_toolset) as url:
             paths["mcp_http"] = asyncio.run(
-                run_mcp_suite(url, args.runs, args.warmup)
+                run_mcp_suite(url, args.runs, args.warmup, active_toolset)
             )
     result = {
         "captured_at": datetime.now(timezone.utc).isoformat(),

@@ -1,8 +1,12 @@
-# Tool coverage — full command sweep
+# Tool coverage — historical live sweep + current automated checks
 
-Every `commands.py` verb exercised against a live Vectorworks 2026 blank document, 10 phases, driven through the full MCP → file-IPC → pump chain (i.e. the real path, not unit stubs).
+The table below records the original 222-case live Vectorworks 2026 sweep. It is
+historical evidence, **not** a claim that every current command is live-tested:
+the server now exposes 291 typed MCP tools backed by 368 public plugin verbs.
+Current pull-request coverage is the automated `tests/` suite; new or changed
+`vs.*` behavior still requires a focused live bridge readback before deployment.
 
-## Totals
+## Historical live-sweep totals
 
 | status | count | meaning |
 |---|---|---|
@@ -34,6 +38,20 @@ The sweep is a regression harness: each FAIL became a fix in `commands.py`. API 
 - 3D extrudes, dimensions, class visibility, IFC props, worksheet cells, save, symbol-from-objects, mirror, layer rename — all called functions that don't exist under VW2026 names; corrected.
 - Every fix re-verified by re-running its phase in the background.
 
-## Re-running the sweep
+## Current verification
 
-Requires a **blank** document (`Ohne Titel` / `Untitled`) — a guard refuses to run against a named project file. Phases are queued as `execute_script` jobs; with bridge v12+ they drain in the background (no focus needed). Runner + phase definitions live in the session scratchpad (`sweep.py`).
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m py_compile vwx-plugin/*.py mcp-server/*.py
+```
+
+The latency harness additionally verifies the selected `VWX_TOOLSET` and live
+MCP/file-IPC path when Vectorworks is running. Focused mutation tests must use a
+named disposable document and verify state after the call.
+
+## Re-running the historical sweep
+
+The original scratchpad runner was not retained, so this exact 222-case sweep is
+not currently reproducible. Do not cite it as current coverage. A replacement
+must live under `tools/` with a named disposable-document guard before this
+section can again claim a full live sweep.

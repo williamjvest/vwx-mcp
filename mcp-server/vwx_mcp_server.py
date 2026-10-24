@@ -1581,10 +1581,14 @@ def qa_autopilot(
         revision_snapshot: Optional[Dict[str, Any]] = None,
         require_clean_selection: bool = True,
         clear_selection: bool = True,
+        update_viewports: Optional[List[str]] = None,
+        recalculate_worksheets: Optional[List[str]] = None,
         save: bool = False,
         plan_token: Optional[str] = None,
         confirm: bool = False) -> str:
-    """Bounded state QA with annotation readback; optionally clear selection and save."""
+    """Bounded state QA: surface temporary artifacts and selection; optionally
+    update named viewports (UpdateVP + existence check), recalculate named
+    worksheets (RecalculateWS + readback), clear selection, and save."""
     p: Dict[str, Any] = {
         "layers": layers, "temporary_prefixes": temporary_prefixes or ["MCP-", "TMP-"],
         "dimension_expectations": dimension_expectations or [],
@@ -1594,6 +1598,8 @@ def qa_autopilot(
     if baseline_name: p["baseline_name"] = baseline_name
     if revision_snapshot: p["revision_snapshot"] = revision_snapshot
     if plan_token: p["plan_token"] = plan_token
+    if update_viewports: p["update_viewports"] = update_viewports
+    if recalculate_worksheets: p["recalculate_worksheets"] = recalculate_worksheets
     return cmd("qa_autopilot", p)
 
 @vtool
@@ -2166,6 +2172,26 @@ def create_tapered_extrude(ctx: Context, object_id: str, angle: float = 10, heig
 def create_loft(ctx: Context, group_id: str, ruled: bool = False, closed: bool = False, solid: bool = False) -> str:
     """Loft/skin NURBS surfaces through a GROUP of cross-section curves."""
     return cmd("create_loft", {"group_id": group_id, "ruled": ruled, "closed": closed, "solid": solid})
+
+@vtool
+def create_verified_loft(ctx: Context, group_id: str, ruled: bool = False,
+                          delete_source: bool = False,
+                          name: str = '', layer: str = '', class_: str = '') -> str:
+    """Solid loft through a group of section curves with explicit result validation.
+
+    Enforces type==84 (solid_loft), non-degenerate bbox, finite 3D centroid, and
+    positive volume (where available).  Deletes the bad output on mismatch.
+    Optionally deletes the source group on success (delete_source=True).
+    Returns bbox, dimensions, center, and volume on success."""
+    p: Dict[str, Any] = {
+        "group_id": group_id,
+        "ruled": ruled,
+        "delete_source": delete_source,
+    }
+    if name: p["name"] = name
+    if layer: p["layer"] = layer
+    if class_: p["class"] = class_
+    return cmd("create_verified_loft", p)
 
 @vtool
 def draw_locus(ctx: Context, x: float = 0, y: float = 0) -> str:

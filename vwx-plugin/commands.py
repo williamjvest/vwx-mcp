@@ -825,6 +825,136 @@ def create_loft(p):
                               bool(p.get('closed', False)), bool(p.get('solid', False)))
     return {'status': 'ok', 'object_id': _oid(h)}
 
+
+def create_verified_loft(p):
+    """Verified solid-loft workflow with explicit post-creation checks.
+
+    Creates a loft via CreateLoftSurfaces(solid=True), then validates:
+      - result type == 84 (solid_loft)
+      - bbox is non-degenerate (all extents > 0)
+      - centroid readback is finite (Get3DCntr)
+      - volume readback is positive (ObjVolume) when available
+
+    On any mismatch the bad result is deleted and an error is returned.
+    The source group is deleted after a successful verified loft only when
+    delete_source=True (default False — the group is the only undo lever).
+
+    params: {group_id, ruled(bool), closed(bool),
+             delete_source(bool), name(str), layer(str), class(str)}
+    """
+    group_id = p.get('group_id')
+    g = _h(group_id)
+    if not g:
+        return {'error': 'group_id (a group of section curves) required'}
+
+    if int(_safe(lambda: vs.GetTypeN(g), 0) or 0) != 11:
+        return {'error': 'group_id must identify a group (type 11)'}
+    target_layer = str(p.get('layer') or '').strip()
+    target_class = str(p.get('class') or '').strip()
+    target_name = str(p.get('name') or '').strip()
+    layer_h = _safe(lambda: vs.GetLayerByName(target_layer)) if target_layer else None
+    if target_layer and not layer_h:
+        return {'error': 'target layer not found: %s' % target_layer}
+    if target_class and target_class not in _class_state_map():
+        return {'error': 'target class not found: %s' % target_class}
+    if target_name:
+        collision = _safe(lambda: vs.GetObject(target_name))
+        if collision:
+            return {'error': 'target name already exists: %s' % target_name}
+
+    h = None
+    try:
+        h = vs.CreateLoftSurfaces(g, bool(p.get('ruled', False)),
+                                  bool(p.get('closed', False)), True)
+    except Exception as exc:
+        return {'error': 'CreateLoftSurfaces raised: %s' % exc}
+
+    if not h:
+        return {'error': 'CreateLoftSurfaces returned no handle (section curves may not form a closed surface)'}
+
+    oid = _oid(h)
+
+    # ── type check ──────────────────────────────────────────────────────────
+    actual_type = int(_safe(lambda: vs.GetTypeN(h), 0) or 0)
+    if actual_type != 84:
+        _safe(lambda: vs.DelObject(h))
+        return {
+            'error': 'loft result is type %d (%s), expected 84 (solid_loft); '
+                     'bad output deleted' % (actual_type, OBJ_TYPES.get(actual_type, 'unknown')),
+            'actual_type': actual_type,
+            'expected_type': 84,
+        }
+
+    # ── bbox check ──────────────────────────────────────────────────────────
+    bbox = _bbox(h)
+    if not bbox or bbox.get('w', 0) <= 0 or bbox.get('h', 0) <= 0:
+        _safe(lambda: vs.DelObject(h))
+        return {'error': 'solid_loft bbox is degenerate (zero-area); bad output deleted',
+                'bbox': bbox}
+
+    # ── 3D info / dims ──────────────────────────────────────────────────────
+    dims, _raw = _dims3(h)
+    if not dims or all(v <= 0 for v in dims.values()):
+        _safe(lambda: vs.DelObject(h))
+        return {'error': 'solid_loft Get3DInfo returned zero extents; bad output deleted',
+                'dims': dims}
+
+    # ── centroid / center ───────────────────────────────────────────────────
+    center = _center3(h)
+    if not center:
+        _safe(lambda: vs.DelObject(h))
+        return {'error': 'solid_loft Get3DCntr returned no usable center; bad output deleted'}
+
+    # ── volume (optional — ObjVolume can reject some valid solid subtypes) ──
+    volume = _safe(lambda: float(vs.ObjVolume(h)))
+    if volume is not None and volume <= 0:
+        _safe(lambda: vs.DelObject(h))
+        return {'error': 'solid_loft volume is non-positive (%.6g); bad output deleted' % volume,
+                'volume': volume}
+
+    # ── requested state + readback ──────────────────────────────────────────
+    if target_layer and not bool(_safe(lambda: vs.SetParent(h, layer_h), False)):
+        _safe(lambda: vs.DelObject(h))
+        return {'error': 'failed to move solid_loft to layer %s; output deleted' % target_layer}
+    if target_class: vs.SetClass(h, target_class)
+    if target_name: vs.SetName(h, target_name)
+    actual = {
+        'name': str(_safe(lambda: vs.GetName(h), '') or ''),
+        'class': str(_safe(lambda: vs.GetClass(h), '') or ''),
+        'layer': str(_safe(lambda: vs.GetLName(vs.GetLayer(h)), '') or ''),
+    }
+    if ((target_name and actual['name'] != target_name) or
+            (target_class and actual['class'] != target_class) or
+            (target_layer and actual['layer'] != target_layer)):
+        _safe(lambda: vs.DelObject(h))
+        return {'error': 'solid_loft state readback mismatch; output deleted',
+                'expected': {'name': target_name, 'class': target_class,
+                             'layer': target_layer}, 'actual': actual}
+
+    # ── optional source cleanup ───────────────────────────────────────────────
+    source_deleted = False
+    if bool(p.get('delete_source', False)):
+        _safe(lambda: vs.DelObject(g))
+        source_deleted = not bool(_h(group_id))
+        if not source_deleted:
+            _safe(lambda: vs.DelObject(h))
+            return {'error': 'source group cleanup failed; loft output deleted'}
+
+    return {
+        'status': 'ok',
+        'object_id': oid,
+        'type': 84,
+        'type_name': 'solid_loft',
+        'name': actual['name'] or None,
+        'class': actual['class'],
+        'layer': actual['layer'],
+        'bbox': bbox,
+        'dimensions': dims,
+        'center': center,
+        'volume': volume,
+        'source_group_deleted': source_deleted,
+    }
+
 def draw_locus(p):
     """2D reference point (locus). params: {x, y}."""
     prev = _with_layer_class(p)
@@ -1277,6 +1407,18 @@ def get_assembly_manifest(p):
                 value = _safe(lambda field=field: vs.GetRField(h, rec_name, field))
                 if value not in (None, ''):
                     pio[field] = value
+        # For native geometry (solids, lofts, extrudes, sweeps, NURBS — any
+        # non-PIO type) the texture is not stored in a record field but in the
+        # object's texture slot.  Read it with GetTextureRefN + Index2Name so
+        # that solid_loft (type 84) and extrude (type 24) parts report their
+        # texture the same way PIO members do via MemberTexture_3D.
+        # PIO objects (type 86/68) keep the MemberTexture_3D path; the native
+        # path is skipped when rec_name is set to avoid double-reporting.
+        native_texture = None
+        if not rec_name and t not in (15, 86, 68):
+            ref = int(_safe(lambda h=h: vs.GetTextureRefN(h, 0, 0, True), 0) or 0)
+            if ref:
+                native_texture = _safe(lambda ref=ref: vs.Index2Name(ref), '') or None
         return {
             'object_id': _oid(h),
             'name': name,
@@ -1304,7 +1446,7 @@ def get_assembly_manifest(p):
                 'end_bevel': pio.get('EndBevel'),
             } if pio else None,
             'material': pio.get('MemberMaterial') if pio else None,
-            'texture': pio.get('MemberTexture_3D') if pio else None,
+            'texture': pio.get('MemberTexture_3D') if pio else native_texture,
             'pio': pio or None,
         }
 
@@ -5184,40 +5326,133 @@ def recalculate_worksheet(p):
 # ── Export / Import ─────────────────────────────────────────────────────────
 
 def export_pdf(p):
-    path = p.get('path', '')
-    try:
-        if vs.AcquireExportPDFSettingsAndLocation(False):
-            if vs.OpenPDFDocument(path):
-                vs.ExportPDFPages(p.get('pages', ''))
-                vs.ClosePDFDocument()
-                return {'status': 'ok', 'path': path}
-        return {'error': 'PDF export cancelled'}
-    except Exception as e:
-        return {'error': str(e)}
+    """PDF export requires an interactive dialog on Vectorworks 2026 (macOS).
+    AcquireExportPDFSettingsAndLocation raises a modal sheet; there is no
+    proven headless path — so this tool refuses by default.
+
+    The only safe unattended path is to call the 'Export PDF' menu command
+    from a script that already has a PDF settings preset locked in, and even
+    then the success/failure signal is invisible to the bridge.  Until that
+    is verified end-to-end this function fails closed.
+
+    params: {path} — ignored; present for schema compat only.
+    """
+    return {
+        'error': 'PDF export requires manual interaction',
+        'code': 'MODAL_DIALOG_REQUIRED',
+        'detail': (
+            'export_pdf opens a modal sheet on Vectorworks 2026 (macOS) '
+            'and cannot succeed in an unattended bridge call. '
+            'Export PDF manually via File → Export → Export PDF, or use '
+            'a pre-configured print preset with the page-setup dialog suppressed.'
+        ),
+    }
 
 def export_dxf(p):
+    """DXF/DWG export on Vectorworks 2026 (macOS).
+
+    vs.ExportDXFDWG() opens a modal dialog — not safe for unattended use.
+    vs.ExportDXFDWG_Batch(path) is a batch API that may work headlessly but
+    the success signal is a void return and post-write file existence is the
+    only verification path.  This function uses the batch form when a path is
+    supplied and verifies the output file was written.
+
+    params: {path (required for headless — must be absolute .dxf or .dwg)}
+    """
+    path_str = str(p.get('path') or '').strip()
+    if not path_str:
+        return {
+            'error': 'DXF/DWG export requires a path or manual interaction',
+            'code': 'MODAL_DIALOG_REQUIRED',
+            'detail': (
+                'export_dxf without a path opens a modal dialog and cannot '
+                'succeed in an unattended bridge call. Supply an absolute path.'
+            ),
+        }
+    if not os.path.isabs(path_str):
+        return {'error': 'absolute path required for unattended DXF export'}
+    ext = os.path.splitext(path_str)[1].lower()
+    if ext not in ('.dxf', '.dwg'):
+        return {'error': 'export path must end in .dxf or .dwg'}
+    parent = os.path.dirname(path_str)
+    if not os.path.isdir(parent):
+        return {'error': 'export directory does not exist: %s' % parent}
+    before = _safe(lambda: (os.path.getsize(path_str), os.stat(path_str).st_mtime_ns))
     try:
-        path = p.get('path', '')
-        if path:
-            _safe(lambda: vs.ExportDXFDWG_Batch(path))
-            return {'status': 'ok', 'path': path}
-        vs.ExportDXFDWG()
-        return {'status': 'ok'}
-    except Exception as e:
-        return {'error': str(e)}
+        vs.ExportDXFDWG_Batch(path_str)
+    except Exception as exc:
+        return {'error': str(exc)}
+    if not os.path.isfile(path_str):
+        return {
+            'error': 'ExportDXFDWG_Batch returned but no file was written — '
+                     'export settings dialog may have intercepted the call',
+            'path': path_str,
+        }
+    after = (os.path.getsize(path_str), os.stat(path_str).st_mtime_ns)
+    if before is not None and after == before:
+        return {'error': 'DXF/DWG output file was not updated', 'path': path_str}
+    if after[0] <= 0:
+        return {'error': 'DXF/DWG export wrote an empty file', 'path': path_str}
+    return {'status': 'ok', 'path': path_str, 'size': after[0]}
 
 def export_image(p):
+    """Headless image export with strict pre- and post-write verification.
+
+    Fails closed on:
+      - missing / relative path
+      - missing parent directory
+      - unsupported extension
+      - VW engine exception
+      - file not present after the call
+      - file is empty (zero bytes)
+
+    params: {path (absolute), width(int), height(int), dpi(int),
+             format('png'|'jpg'|'tif')}
+    """
+    path_str = str(p.get('path') or '').strip()
+    if not path_str:
+        return {'error': 'path is required for export_image'}
+    if not os.path.isabs(path_str):
+        return {'error': 'absolute path required; got: %r' % path_str}
+    ext = os.path.splitext(path_str)[1].lower()
+    fmap = {'png': 4, 'jpg': 2, 'jpeg': 2, 'tif': 3, 'tiff': 3}
+    if ext.lstrip('.') not in fmap:
+        return {'error': 'unsupported image extension %r; use png/jpg/tif' % ext}
+    parent = os.path.dirname(path_str)
+    if not os.path.isdir(parent):
+        return {'error': 'export directory does not exist: %s' % parent}
     try:
-        path = p.get('path', '')
         w = int(p.get('width', 2000))
-        h = int(p.get('height', 1500))
+        h_px = int(p.get('height', 1500))
         dpi = int(p.get('dpi', 150))
-        fmt = p.get('format', 'png').lower()
-        fmap = {'png': 4, 'jpg': 2, 'jpeg': 2, 'tif': 3, 'tiff': 3}
-        vs.ExportImageFile(path, w, h, dpi, fmap.get(fmt, 4))
-        return {'status': 'ok', 'path': path}
-    except Exception as e:
-        return {'error': str(e)}
+    except (TypeError, ValueError) as exc:
+        return {'error': 'width/height/dpi must be integers: %s' % exc}
+    if w <= 0 or h_px <= 0 or dpi <= 0:
+        return {'error': 'width/height/dpi must be positive integers'}
+    fmt = str(p.get('format', ext.lstrip('.')) or ext.lstrip('.')).lower()
+    canonical = {'jpeg': 'jpg', 'tiff': 'tif'}
+    if canonical.get(fmt, fmt) != canonical.get(ext.lstrip('.'), ext.lstrip('.')):
+        return {'error': 'format does not match output extension'}
+    fmt_code = fmap[fmt]
+    before = _safe(lambda: (os.path.getsize(path_str), os.stat(path_str).st_mtime_ns))
+    try:
+        ok = vs.ExportImageFile(path_str, w, h_px, dpi, fmt_code)
+    except Exception as exc:
+        return {'error': 'ExportImageFile raised: %s' % exc, 'path': path_str}
+    if ok is False:
+        return {'error': 'ExportImageFile returned false', 'path': path_str}
+    if not os.path.isfile(path_str):
+        return {'error': 'ExportImageFile returned but no file was written',
+                'path': path_str}
+    size = os.path.getsize(path_str)
+    if size == 0:
+        return {'error': 'ExportImageFile wrote an empty file', 'path': path_str,
+                'size': size}
+    after = (size, os.stat(path_str).st_mtime_ns)
+    if before is not None and after == before:
+        return {'error': 'image output file was not updated', 'path': path_str}
+    return {'status': 'ok', 'path': path_str, 'width': w, 'height': h_px,
+            'dpi': dpi, 'format': fmt, 'size': size}
 
 def export_stl(p):
     """Headless STL export with explicit path and post-write verification."""
@@ -5242,6 +5477,7 @@ def export_stl(p):
     if scope == 'selected' and not _collect('SEL=TRUE', 1):
         return {'error': 'no visible objects selected for STL export'}
     binary = bool(p.get('binary', True))
+    before = _safe(lambda: (os.path.getsize(path), os.stat(path).st_mtime_ns))
     try:
         ok = bool(vs.ExportSTL(path, binary, tess, options[scope]))
     except Exception as e:
@@ -5251,22 +5487,50 @@ def export_stl(p):
     if not os.path.isfile(path):
         return {'error': 'Vectorworks reported success but no STL was written',
                 'path': path}
-    return {'status': 'ok', 'path': path, 'size': os.path.getsize(path),
+    after = (os.path.getsize(path), os.stat(path).st_mtime_ns)
+    if before is not None and after == before:
+        return {'error': 'STL output file was not updated', 'path': path}
+    if after[0] <= 0:
+        return {'error': 'STL export wrote an empty file', 'path': path}
+    return {'status': 'ok', 'path': path, 'size': after[0],
             'binary': binary, 'tessellation': tess, 'scope': scope}
 
 def import_dwg(p):
-    try:
-        vs.ImportDXFDWG(p.get('path', ''), False)
-        return {'status': 'ok'}
-    except Exception as e:
-        return {'error': str(e)}
+    """DWG/DXF import requires a modal dialog on Vectorworks 2026 (macOS).
+
+    vs.ImportDXFDWG raises a modal import-settings sheet with no suppression
+    flag that works reliably in the bridge environment.  This function refuses
+    by default to prevent false 'status: ok' returns that hide the dialog.
+
+    params: {path} — present for schema compat; not used.
+    """
+    return {
+        'error': 'DWG/DXF import requires manual interaction',
+        'code': 'MODAL_DIALOG_REQUIRED',
+        'detail': (
+            'import_dwg opens a modal import-settings dialog on Vectorworks 2026 '
+            '(macOS) and cannot succeed in an unattended bridge call. '
+            'Import DWG/DXF manually via File → Import → Import DXF/DWG.'
+        ),
+    }
 
 def export_shp(p):
-    try:
-        vs.ExportSHP(p.get('path', ''))
-        return {'status': 'ok', 'path': p.get('path')}
-    except Exception as e:
-        return {'error': str(e)}
+    """Shapefile export on Vectorworks 2026 (macOS).
+
+    vs.ExportSHP opens a modal export dialog on macOS; there is no proven
+    headless API path.  This function refuses by default.
+
+    params: {path} — present for schema compat; not used.
+    """
+    return {
+        'error': 'Shapefile export requires manual interaction',
+        'code': 'MODAL_DIALOG_REQUIRED',
+        'detail': (
+            'export_shp opens a modal export dialog on Vectorworks 2026 (macOS) '
+            'and cannot succeed in an unattended bridge call. '
+            'Export Shapefile manually via File → Export → Export Shapefile.'
+        ),
+    }
 
 def import_image(p):
     try:
@@ -9792,9 +10056,11 @@ def _valid_revision_snapshot(snapshot):
 
 def _revision_baseline_root():
     override = globals().get('_REVISION_BASELINE_ROOT_OVERRIDE')
+    # Keep baselines beside the deployed bridge so the location follows the
+    # configured plugin directory on both macOS and Windows. The previous
+    # hard-coded macOS Library path created a bogus C:\Users\...\Library tree.
     return (str(override) if override else os.path.join(
-        os.path.expanduser('~'), 'Library', 'Application Support',
-        'Vectorworks', '2026', 'VWX-MCP-Baselines'))
+        os.path.dirname(os.path.abspath(__file__)), 'baselines'))
 
 
 def _revision_baseline_document_dir():
@@ -10710,6 +10976,26 @@ def _plan_qa_autopilot(p):
     if selection_index.get('errors'): blocking.append('global selection index contains read errors')
     if temporary: blocking.append('temporary proof artifacts remain')
     if any(row['state'] != 'ok' for row in dimension_findings): blocking.append('dimension readback failed')
+    refresh_targets = {}
+    for field, valid_types in (('update_viewports', {122}),
+                               ('recalculate_worksheets', {18, 94})):
+        names = p.get(field) or []
+        if isinstance(names, str): names = [names]
+        if not isinstance(names, list) or len(names) > 200:
+            return None, '%s must be a string/list of at most 200 names' % field
+        names = [str(name).strip() for name in names]
+        if any(not name for name in names) or len(names) != len(set(names)):
+            return None, '%s names must be unique and non-empty' % field
+        findings = []
+        for name in names:
+            h = _safe(lambda name=name: vs.GetObject(name))
+            object_type = int(_safe(lambda h=h: vs.GetTypeN(h), 0) or 0) if h else 0
+            state = 'ok' if h and object_type in valid_types else (
+                'missing' if not h else 'wrong_type')
+            findings.append({'name': name, 'type': object_type, 'state': state})
+        if any(row['state'] != 'ok' for row in findings):
+            blocking.append('%s target validation failed' % field)
+        refresh_targets[field] = findings
     require_clean_selection = bool(p.get('require_clean_selection', True))
     fixable = []
     if require_clean_selection and selected: fixable.append('selection is not clean')
@@ -10737,6 +11023,7 @@ def _plan_qa_autopilot(p):
                'temporary_ids': [row['object_id'] for row in temporary],
                'selected_ids': sorted(row['object_id'] for row in selected if row['object_id']),
                'dimension_findings': dimension_findings,
+               'refresh_targets': refresh_targets,
                'blocking': blocking, 'fixable': fixable,
                'baseline_name': p.get('baseline_name'),
                'revision_token': revision.get('diff_token') if isinstance(revision, dict) else None}
@@ -10748,8 +11035,81 @@ def _plan_qa_autopilot(p):
             'revision': revision, 'plan_token': _revision_digest(payload)}, None
 
 
+def _qa_update_named_viewports(viewport_names):
+    """Update named viewports and verify each exists after update.
+
+    Returns {'updated': [...], 'missing': [...], 'errors': [...]}.
+    viewport_names: list of viewport name strings.
+    """
+    updated, missing, errors = [], [], []
+    for name in viewport_names:
+        h = _safe(lambda name=name: vs.GetObject(name))
+        if not h:
+            missing.append(name)
+            continue
+        t = int(_safe(lambda h=h: vs.GetTypeN(h), 0) or 0)
+        if t != 122:  # 122 = viewport
+            errors.append({'name': name, 'error': 'object is not a viewport (type %d)' % t})
+            continue
+        try:
+            vs.UpdateVP(h)
+        except Exception as exc:
+            errors.append({'name': name, 'error': str(exc)})
+            continue
+        # verify still exists after update
+        if not _safe(lambda name=name: vs.GetObject(name)):
+            errors.append({'name': name, 'error': 'viewport disappeared after UpdateVP'})
+        else:
+            updated.append(name)
+    return {'updated': updated, 'missing': missing, 'errors': errors}
+
+
+def _qa_recalculate_named_worksheets(worksheet_names):
+    """Recalculate named worksheets and verify readback.
+
+    Returns {'recalculated': [...], 'missing': [...], 'errors': [...]}.
+    worksheet_names: list of worksheet name strings.
+    """
+    recalculated, missing, errors = [], [], []
+    for name in worksheet_names:
+        ws = _safe(lambda name=name: vs.GetObject(name))
+        if not ws:
+            missing.append(name)
+            continue
+        t = int(_safe(lambda ws=ws: vs.GetTypeN(ws), 0) or 0)
+        if t not in (18, 94):  # 18/94 = worksheet
+            errors.append({'name': name, 'error': 'object is not a worksheet (type %d)' % t})
+            continue
+        try:
+            vs.RecalculateWS(ws)
+        except Exception as exc:
+            errors.append({'name': name, 'error': 'RecalculateWS raised: %s' % exc})
+            continue
+        # verify still exists and is readable
+        ws2 = _safe(lambda name=name: vs.GetObject(name))
+        if not ws2:
+            errors.append({'name': name, 'error': 'worksheet disappeared after RecalculateWS'})
+            continue
+        size = _safe(lambda ws2=ws2: vs.GetWSRowColumnCount(ws2))
+        if not isinstance(size, (list, tuple)) or len(size) < 2:
+            errors.append({'name': name, 'error': 'worksheet size unreadable after recalculate'})
+        else:
+            recalculated.append({'name': name, 'rows': int(size[0]), 'columns': int(size[1])})
+    return {
+        'recalculated': recalculated,
+        'missing': missing,
+        'errors': errors,
+    }
+
+
 def qa_autopilot(p):
-    """Run bounded state QA; optionally clear selection and save after token confirmation."""
+    """Run bounded state QA; optionally clear selection, update viewports,
+    recalculate worksheets, verify existence/readback, then save.
+
+    New params (all optional):
+      update_viewports:    list of viewport names to UpdateVP before save
+      recalculate_worksheets: list of worksheet names to RecalculateWS before save
+    """
     plan, error = _plan_qa_autopilot(p)
     if error: return {'error': error}
     if not bool(p.get('confirm', False)): return plan
@@ -10767,14 +11127,47 @@ def qa_autopilot(p):
                 return {'status': 'error', 'error': 'selected object disappeared: %s' % object_id}
             vs.SetDSelect(h)
         cleared = len(selected_ids)
+
+    # ── compound final-QA: named viewport updates ────────────────────────────
+    refresh_targets = plan.get('refresh_targets') or {}
+    viewport_names = [row['name'] for row in
+                      refresh_targets.get('update_viewports', [])]
+    if not viewport_names:
+        viewport_names = [str(name) for name in (p.get('update_viewports') or [])]
+    vp_result = None
+    if viewport_names:
+        vp_result = _qa_update_named_viewports([str(n) for n in viewport_names])
+        if vp_result['missing'] or vp_result['errors']:
+            return {'status': 'error',
+                    'error': 'viewport update failed',
+                    'viewport_result': vp_result}
+
+    # ── compound final-QA: named worksheet recalculate ───────────────────────
+    worksheet_names = [row['name'] for row in
+                       refresh_targets.get('recalculate_worksheets', [])]
+    if not worksheet_names:
+        worksheet_names = [str(name) for name in
+                           (p.get('recalculate_worksheets') or [])]
+    ws_result = None
+    if worksheet_names:
+        ws_result = _qa_recalculate_named_worksheets([str(n) for n in worksheet_names])
+        if ws_result['missing'] or ws_result['errors']:
+            return {'status': 'error',
+                    'error': 'worksheet recalculate failed',
+                    'worksheet_result': ws_result}
+
     if bool(p.get('save', False)):
         saved = save_document({})
         if saved.get('status') != 'ok': return {'status': 'error', 'error': 'save failed', 'save_result': saved}
     verify, verify_error = _plan_qa_autopilot(p)
     if verify_error: return {'status': 'error', 'error': verify_error}
+    changed = bool(cleared or p.get('save') or viewport_names or worksheet_names)
     return {'status': 'ok' if verify['passed_state_checks'] else 'error',
-            'changed': bool(cleared or p.get('save')), 'cleared_selection_count': cleared,
-            'saved': bool(p.get('save', False)), 'verification': verify,
+            'changed': changed, 'cleared_selection_count': cleared,
+            'saved': bool(p.get('save', False)),
+            'viewport_result': vp_result,
+            'worksheet_result': ws_result,
+            'verification': verify,
             'visual_required': True, 'capture_command': 'vwx-capture <output.png>'}
 
 
