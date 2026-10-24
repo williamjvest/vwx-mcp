@@ -35,7 +35,8 @@ def plugin_dir() -> Path:
     if configured:
         return Path(configured).expanduser()
     if sys.platform == "darwin":
-        return Path.home() / "Library/Application Support/Vectorworks/2026/Plug-ins/VWX-MCP"
+        year = os.environ.get("VWX_VW_VERSION", "2027")
+        return Path.home() / f"Library/Application Support/Vectorworks/{year}/Plug-ins/VWX-MCP"
     appdata = os.environ.get("APPDATA")
     if appdata:
         for name in ("VWX-MCP", "VW-MCP"):

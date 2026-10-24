@@ -11913,8 +11913,10 @@ def compile_document_changes(p):
             if 'name' in row['differences']: vs.SetName(h, target['name'])
             if 'center' in row['differences']:
                 now = _center3(h)
-                vs.HMove3D(h, target['center']['x'] - now['x'],
-                          target['center']['y'] - now['y'], target['center']['z'] - now['z'])
+                # vs.HMove3D does not exist (checked live on VW2027 and absent from the
+                # 2026/2027 indexes): every center update raised and rolled back.
+                vs.Move3DObj(h, target['center']['x'] - now['x'],
+                             target['center']['y'] - now['y'], target['center']['z'] - now['z'])
             actual = {'name': str(_safe(lambda h=h: vs.GetName(h), '') or ''),
                       'class': str(_safe(lambda h=h: vs.GetClass(h), '') or ''),
                       'layer': str(_safe(lambda h=h: vs.GetLName(vs.GetLayer(h)), '') or ''),
@@ -11933,7 +11935,7 @@ def compile_document_changes(p):
             _safe(lambda h=h, current=current: vs.SetName(h, current['name']))
             if current.get('center'):
                 now = _center3(h)
-                _safe(lambda h=h, now=now, current=current: vs.HMove3D(
+                _safe(lambda h=h, now=now, current=current: vs.Move3DObj(
                     h, current['center']['x'] - now['x'], current['center']['y'] - now['y'],
                     current['center']['z'] - now['z']))
         for row in journal:

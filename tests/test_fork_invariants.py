@@ -72,6 +72,18 @@ class SurfaceConsistencyTests(unittest.TestCase):
                   and n.func.id.startswith("_")}
         self.assertEqual(sorted(called - defined), [])
 
+    def test_every_vs_call_exists_in_the_index(self):
+        # A call to a vs function that does not exist raises at runtime. Nothing
+        # flags it until that path runs: compile_document_changes called
+        # vs.HMove3D for months, so every center update rolled back.
+        index = json.loads((ROOT / "vwx-plugin" / "vs_index.json").read_text())
+        tree = ast.parse(COMMANDS.read_text())
+        called = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "vs"}
+        known_upstream = {"GetPolyClosed"}   # upstream terrain code, hasattr-guarded
+        self.assertEqual(sorted(called - set(index) - known_upstream), [])
+
     def test_loader_is_ascii(self):
         (ROOT / "vwx-plugin" / "BridgeStart_MenuCommand.py").read_bytes().decode("ascii")
 
