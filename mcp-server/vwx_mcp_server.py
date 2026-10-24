@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Vectorworks 2026 MCP Server — socket proxy to VWX plugin (150 tools)
-Connects to the VWX MCP bridge running inside Vectorworks 2026.
+Vectorworks MCP Server — file/socket proxy to the VWX plugin (249 tools).
+
+Connects to the VWX MCP bridge running inside Vectorworks. The Vectorworks
+major version is discovered at runtime (see vw_versions), not hardcoded;
+set VWX_VW_VERSION to pin one.
 """
 
 import os
+import io
 import sys
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 import socket
@@ -25,12 +30,44 @@ VWX_HOST = os.environ.get("DESKTOP_HOST", "127.0.0.1")
 VWX_PORT = int(os.environ.get("VWX_MCP_PORT", os.environ.get("VW_MCP_PORT", "9878")))
 # Per-call timeout (seconds) applied to every tool via vtool() -> @mcp.tool(timeout=).
 # Guards against a hung Vectorworks main thread wedging the MCP session.
-VWX_CALL_TIMEOUT = float(os.environ.get("VWX_CALL_TIMEOUT", "60"))
-# TCP recv timeout towards the VW bridge. Long dispatches (bulk sweeps, imports,
-# exports) legitimately exceed 30s while VW's main thread works and the GIL
-# freezes the bridge's I/O threads. Keep just under VWX_CALL_TIMEOUT so the
-# socket error surfaces before the MCP layer kills the call.
-VWX_SOCKET_TIMEOUT = float(os.environ.get("VWX_SOCKET_TIMEOUT", "55"))
+#
+# The old default was 60s, which capped every call BELOW the two-minute mark at
+# which an MCP client moves a long call to a background task -- so a genuinely
+# long export could only ever come back as a timeout plus a 'poll' hint, never
+# as a backgrounded result. The ceiling is now well past that mark and the
+# progress heartbeat below keeps the client's idle-abort off the call, so long
+# operations background themselves and return a real result.
+VWX_CALL_TIMEOUT = float(os.environ.get("VWX_CALL_TIMEOUT", "900"))
+# TCP recv / result-file wait towards the VW bridge. Long dispatches (bulk
+# sweeps, imports, exports) legitimately run for minutes while VW's main thread
+# works and the GIL freezes the bridge's I/O threads. Keep just under
+# VWX_CALL_TIMEOUT so the transport error surfaces before the MCP layer kills
+# the call.
+VWX_SOCKET_TIMEOUT = float(os.environ.get("VWX_SOCKET_TIMEOUT", "880"))
+# Progress heartbeat interval (seconds). While any tool call is outstanding the
+# heartbeat middleware emits a progress notification on this cadence. Two
+# reasons: an MCP client aborts a call that sends neither a response nor a
+# progress notification for its idle window (five minutes for HTTP servers),
+# and the notifications are what make a backgrounded call visibly alive rather
+# than apparently hung. Set to 0 to disable.
+VWX_HEARTBEAT = float(os.environ.get("VWX_HEARTBEAT", "20"))
+# Read-only response cache TTL (seconds). Applies ONLY to the explicit
+# allowlist in _CACHEABLE below -- never to anything that can mutate the
+# document. 0 disables the cache entirely.
+VWX_CACHE_TTL = int(os.environ.get("VWX_CACHE_TTL", "45"))
+# Bridge liveness. The native palette rewrites ipc/native.alive on every timer
+# tick (~100ms) while it is open; nothing drains the job queue while it is
+# closed. A heartbeat older than MAX_AGE means the bridge is down; GRACE is how
+# long we tolerate that before giving up on an in-flight job, which has to
+# survive a palette restart and a Vectorworks modal that stalls the tick.
+VWX_ALIVE_MAX_AGE = float(os.environ.get("VWX_ALIVE_MAX_AGE", "8"))
+VWX_ALIVE_GRACE = float(os.environ.get("VWX_ALIVE_GRACE", "20"))
+# A Vectorworks modal dialog open this long while a call waits = report it
+# (title, text, buttons) instead of waiting out the whole timeout.
+VWX_MODAL_GRACE = float(os.environ.get("VWX_MODAL_GRACE", "2"))
+# Heartbeat already older than this when a call starts = bridge is off, fail
+# immediately (no grace wait).
+VWX_ALIVE_STALE = float(os.environ.get("VWX_ALIVE_STALE", "60"))
 # File-transport result polling is active only while a tool call is waiting.
 # 10ms keeps CPU negligible but removes most of the old 30ms quantization delay.
 VWX_RESULT_POLL = max(0.003, float(os.environ.get("VWX_RESULT_POLL", "0.01")))
@@ -68,16 +105,39 @@ VWX_WAKE_TIMEOUT = float(os.environ.get('VWX_WAKE_TIMEOUT', '25'))
 VWX_TRANSPORT = os.environ.get(
     'VWX_TRANSPORT', 'file' if sys.platform == 'win32' else 'tcp').lower()
 
+def vw_versions():
+    """Vectorworks major versions installed for this user, newest first.
+
+    The version was hardcoded to '2026' in six files. Nothing about the bridge
+    is 2026-specific on the Python side, and the failure mode when a new
+    Vectorworks ships is silent — the probe simply returns None and every tool
+    reports 'plugin dir not found'. Discover the versions instead.
+    """
+    forced = os.environ.get('VWX_VW_VERSION')
+    if forced:
+        return [forced]
+    root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
+                        'Vectorworks')
+    try:
+        found = [d for d in os.listdir(root)
+                 if len(d) == 4 and d.isdigit()
+                 and os.path.isdir(os.path.join(root, d))]
+    except Exception:
+        return []
+    return sorted(found, reverse=True)
+
+
 def _plugin_dir():
     base = os.environ.get('VWX_PLUGIN_DIR')
     if base and os.path.isdir(base):
         return base
     appdata = os.environ.get('APPDATA', '')
-    for name in ('VW-MCP', 'VWX-MCP'):
-        cand = os.path.join(appdata, 'Nemetschek', 'Vectorworks', '2026',
-                            'Plug-ins', name)
-        if os.path.isdir(cand):
-            return cand
+    for version in vw_versions():
+        for name in ('VW-MCP', 'VWX-MCP'):
+            cand = os.path.join(appdata, 'Nemetschek', 'Vectorworks', version,
+                                'Plug-ins', name)
+            if os.path.isdir(cand):
+                return cand
     return None
 
 def _wake_file_path():
@@ -99,13 +159,50 @@ class VwxFileTransport:
             raise RuntimeError("VW plugin dir not found (set VWX_PLUGIN_DIR)")
         self.jobs = os.path.join(base, 'ipc', 'jobs')
         self.results = os.path.join(base, 'ipc', 'results')
+        self.alive = os.path.join(base, 'ipc', 'native.alive')
         os.makedirs(self.jobs, exist_ok=True)
         os.makedirs(self.results, exist_ok=True)
         self._lock = threading.Lock()
 
+    def bridge_state(self):
+        """(alive, paused, age_seconds) from the native palette's heartbeat.
+
+        The palette rewrites ipc/native.alive as "<epoch> <paused 0|1>" on every
+        timer tick while it is open. Nothing drains the job queue when the
+        palette is closed, so without this check a job submitted to a closed
+        bridge simply sits there until the call times out. That was survivable
+        while the timeout was 55s; now that it is long enough for real exports
+        to finish, waiting it out would mean a fifteen-minute hang for what is
+        actually an immediately-knowable "the bridge is off" — so check first
+        and keep checking.
+        """
+        try:
+            with open(self.alive, 'r') as fh:
+                parts = fh.read().split()
+            stamp = float(parts[0])
+            paused = len(parts) > 1 and parts[1] == '1'
+        except Exception:
+            return (False, False, float('inf'))
+        age = max(0.0, time.time() - stamp)
+        return (age <= VWX_ALIVE_MAX_AGE, paused, age)
+
     # keep the VwxMCPServer interface so callers don't care about transport
     def disconnect(self):
         pass
+
+    def _discard(self, job_path):
+        """Drop a queued job we have stopped waiting for.
+
+        Only safe while the job is still unclaimed — once the pump renames it
+        to .working it is executing and removing the queue entry would achieve
+        nothing. Leaving a stale job behind would mean it runs later, out of
+        context, against a document that has moved on.
+        """
+        try:
+            if os.path.exists(job_path):
+                os.remove(job_path)
+        except Exception:
+            pass
 
     def _read_result(self, cid):
         rp = os.path.join(self.results, cid + '.json')
@@ -122,7 +219,7 @@ class VwxFileTransport:
             pass
         return result
 
-    def send_command(self, command_type, params=None):
+    def send_command(self, command_type, params=None, meta=None):
         cid = uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
         # 'poll' (async retrieval): just look for the result file.
@@ -135,6 +232,8 @@ class VwxFileTransport:
                     'note': 'file transport: result not written yet'}
         job = {'type': command_type, 'params': params or {}, '_cid': cid,
                'ts': time.time()}
+        if meta:
+            job.update(meta)          # _doc, _prio, _session, _agent (v14 routing)
         jp = os.path.join(self.jobs, '%013d-%s.json' % (time.time() * 1000, cid))
         with self._lock:
             tmp = jp + '.tmp'
@@ -142,6 +241,21 @@ class VwxFileTransport:
                 json.dump(job, f, ensure_ascii=False)
             os.replace(tmp, jp)
         deadline = time.monotonic() + VWX_SOCKET_TIMEOUT
+        dead_since = None
+        # Grace exists to ride out a palette restart or a modal that stalls the
+        # tick. A heartbeat that was already stale long before this call (VW
+        # still booting, palette never opened) is not a hiccup — answer at once
+        # instead of making every call wait the full grace (20 s each, 2026-10-02).
+        alive, _, age = self.bridge_state()
+        if not alive and age > VWX_ALIVE_STALE:
+            self._discard(jp)
+            seen = "never" if age == float('inf') else f"{age:.0f}s ago"
+            return {'error': "the VWX Bridge palette is not running "
+                             f"(last heartbeat: {seen}). Vectorworks may still be "
+                             "starting — open the VWX Bridge palette and retry.",
+                    'cid': cid, 'code': 'VW_BRIDGE_DOWN'}
+        next_dialog_check = time.monotonic() + 1.0
+        modal_since = None
         while time.monotonic() < deadline:
             result = self._read_result(cid)
             if result is not None:
@@ -151,23 +265,88 @@ class VwxFileTransport:
                 logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} "
                             f"status={status} transport=file")
                 return result
+            # A modal dialog blocks VW's main thread, so nothing will answer
+            # until someone clicks it. Report it (with its text and buttons)
+            # after a short grace instead of waiting out the whole timeout --
+            # the caller can read it and answer with vw_dialog_press.
+            if time.monotonic() >= next_dialog_check:
+                next_dialog_check = time.monotonic() + 1.0
+                dlg = _open_dialogs()
+                if dlg:
+                    modal_since = modal_since or time.monotonic()
+                    if time.monotonic() - modal_since >= VWX_MODAL_GRACE:
+                        claimed = not os.path.exists(jp)
+                        if not claimed:
+                            self._discard(jp)      # never ran: safe to retry
+                        logger.warning(f"tool={command_type} cid={cid} "
+                                       f"status=modal dialog={dlg[0]['title']!r}")
+                        return {
+                            'error': "Vectorworks zeigt einen modalen Dialog und "
+                                     "blockiert damit die Bridge: "
+                                     + " | ".join(f"{d['title']}: {d['text'] or '(Text nicht lesbar - screenshot)'}"
+                                                  f" [Knoepfe: {', '.join(d['buttons']) or '-'}]" for d in dlg),
+                            'code': 'VW_MODAL_DIALOG', 'dialogs': dlg, 'cid': cid,
+                            'job': ('laeuft (nach dem Schliessen mit poll/cid abholen, '
+                                    'NICHT wiederholen)' if claimed else
+                                    'nicht gestartet (verworfen, Wiederholen ist sicher)'),
+                            'hint': "Text lesen, dann vw_dialog_press(button=...) -- "
+                                    "nur harmlose Antworten (OK/Nein/Abbrechen) selbst "
+                                    "geben, alles Folgenreiche den Nutzer fragen."}
+                else:
+                    modal_since = None
+            # Fail fast on a bridge that is not running rather than burning the
+            # whole (now long) timeout on a queue nobody is draining.
+            alive, paused, age = self.bridge_state()
+            if alive:
+                dead_since = None
+                if paused:
+                    self._discard(jp)
+                    return {'error': "the VWX Bridge palette is PAUSED -- press "
+                                     "Resume in the palette, then retry.",
+                            'cid': cid, 'code': 'VW_BRIDGE_PAUSED'}
+            elif not os.path.exists(jp):
+                # Our job was CLAIMED: Vectorworks is executing it. A long vs.*
+                # call blocks VW's main thread, and with it the palette timer
+                # that writes the heartbeat -- silence here means "busy", not
+                # "down" (seen live: a 41 s import answered ok after the server
+                # had already reported VW_BRIDGE_DOWN). Keep waiting for the
+                # result up to the normal timeout.
+                dead_since = None
+            else:
+                now = time.monotonic()
+                dead_since = dead_since or now
+                if now - dead_since > VWX_ALIVE_GRACE:
+                    self._discard(jp)
+                    seen = ("never" if age == float('inf')
+                            else f"{age:.0f}s ago")
+                    return {'error': "the VWX Bridge palette is not running "
+                                     f"(last heartbeat: {seen}), so nothing is "
+                                     "draining the job queue. Open the VWX "
+                                     "Bridge palette in Vectorworks and retry.",
+                            'cid': cid, 'code': 'VW_BRIDGE_DOWN'}
             time.sleep(VWX_RESULT_POLL)
-        # timed out: remove the job if the pump never claimed it
+        # Timed out. Distinguish the two cases with a machine-readable code:
+        # a job still sitting in the queue was never dispatched and is safe to
+        # retry, while a claimed job is executing inside Vectorworks and a
+        # retry would run a mutation twice. An opaque timeout cannot tell the
+        # caller which of those it is.
         try:
             if os.path.exists(jp):
                 os.remove(jp)
+                code = 'VW_JOB_UNCLAIMED'
                 hint = ("job was never picked up — is the VWX Bridge palette "
                         "open (bridge on) and Ctrl+Shift+B assigned to "
-                        "'VWX Bridge Start' in VW?")
+                        "'VWX Bridge Start' in VW? Safe to retry.")
             else:
+                code = 'VW_DISPATCH_STUCK'
                 hint = ("job is executing but slow (long operation, Marionette "
-                        "execution, or a modal dialog in VW). Retry with "
-                        "command 'poll' and this cid to fetch the result.")
+                        "execution, or a modal dialog in VW). Do NOT retry — "
+                        "fetch the result with command 'poll' and this cid.")
         except Exception:
-            hint = "unknown"
+            code, hint = 'VW_UNKNOWN', "unknown"
         logger.error(f"tool={command_type} cid={cid} status=timeout transport=file")
         return {'error': f"timed out after {VWX_SOCKET_TIMEOUT:.0f}s — {hint}",
-                'cid': cid}
+                'cid': cid, 'code': code}
 
 
 class VwxMCPServer:
@@ -229,8 +408,11 @@ class VwxMCPServer:
             except Exception: pass
             self.socket = None
 
-    def send_command(self, command_type, params=None):
+    def send_command(self, command_type, params=None, meta=None):
         """Send newline-delimited JSON command, read newline-delimited response.
+
+        meta (v14 document routing) is accepted for interface parity and
+        ignored: the classic dialog bridge always runs in the active document.
 
         One round-trip is serialized under self._lock so concurrent tool calls
         can't interleave on the shared socket. A correlation id (cid) + latency
@@ -327,9 +509,192 @@ def get_vwx_connection():
     return _vwx_connection
 
 
-def cmd(command_type, params=None):
-    """Send command and return JSON string."""
-    return json.dumps(get_vwx_connection().send_command(command_type, params), indent=2)
+# ═══════════════════════════════════════════════════════════════════
+# v14 — several agents, one Vectorworks
+# ═══════════════════════════════════════════════════════════════════
+#
+# Vectorworks runs one command at a time and every vs.* call acts on the
+# active document. Before v14 that made the front document shared mutable
+# state: agent A's switch_document silently redirected agent B's next write.
+# Now every job carries its target document and the in-VW pump activates it
+# (and verifies it) before running the job — see vwx_pump.py. This module
+# decides that target per call:
+#
+#   explicit `document=` argument  >  session binding (use_document)  >  none
+#
+# "none" keeps the pre-v14 meaning: the document the user is working in.
+# On top sit cooperative write locks per document, a priority per session
+# (interactive work overtakes batch harvests), a path policy and an audit log.
+
+# Paths a command may WRITE to or OPEN from. Y: is the office share: read it,
+# never write to it, never open originals from it (VW converts and asks to
+# save on close). Override with VWX_DENY_ROOTS="Y:\;Z:\" (";"-separated).
+VWX_DENY_ROOTS = [r.strip() for r in os.environ.get(
+    "VWX_DENY_ROOTS", "Y:\\;\\\\").split(";") if r.strip()]
+_PATH_KEYS = ("path", "file_path", "filepath", "out_path", "output", "output_path",
+              "folder", "dir", "pfad", "ziel", "target_path", "export_path")
+_WRITE_PATH_PREFIXES = ("export_", "save_document_as", "write_", "resource_export")
+_PRIO = {"interactive": 5, "batch": 8, "background": 9, "urgent": 1}
+
+# Commands that do not depend on which document is in front. They run
+# wherever the bridge currently is and never cause a document switch.
+_DOC_FREE = frozenset({
+    "ping", "list_documents", "vs_signature", "vs_index_stats", "list_commands",
+    "distance", "distance_3d", "polygon_centroid", "three_point_center",
+    "_release",
+})
+# Document-free only when they read a SAVED file instead of the front document.
+_DOC_FREE_WITH_FILE = frozenset({"resource_list", "resource_info_file"})
+
+_coord_lock = threading.Lock()
+_sessions: Dict[str, Dict[str, Any]] = {}     # session id -> binding
+_locks: Dict[str, Dict[str, Any]] = {}        # document key -> lock
+
+
+def _doc_key(doc):
+    """Comparable key for a document reference (base name, case-insensitive).
+
+    Locks are per base name on purpose: two agents writing 'Plan.vwx' from
+    different folders is rare, and a lock that is too broad is harmless while
+    one that is too narrow is not."""
+    s = (doc or "").replace("\\", "/").strip().rsplit("/", 1)[-1].strip(" *").lower()
+    return s or None
+
+
+def _session_info():
+    """(session id, agent name) of the calling MCP session, or (None, None)."""
+    try:
+        from fastmcp.server.dependencies import get_context
+        ctx = get_context()
+    except Exception:
+        return None, None
+    sid = None
+    try:
+        sid = ctx.session_id
+    except Exception:
+        pass
+    agent = None
+    try:
+        cp = ctx.session.client_params
+        # mcp >= 1.2x renamed the pydantic field clientInfo -> client_info
+        info = getattr(cp, "client_info", None) or getattr(cp, "clientInfo", None)
+        agent = "%s %s" % (info.name, getattr(info, "version", "") or "")
+    except Exception:
+        try:
+            agent = ctx.client_id
+        except Exception:
+            agent = None
+    return sid, (agent or "").strip() or None
+
+
+def _under_denied_root(p):
+    n = os.path.normcase(os.path.abspath(p)) if p else ""
+    for root in VWX_DENY_ROOTS:
+        r = os.path.normcase(root)
+        if n.startswith(r) or (p or "").replace("/", "\\").lower().startswith(root.lower()):
+            return root
+    return None
+
+
+def _path_violation(command_type, params):
+    """A write/open aimed at a protected root, or None."""
+    if not (command_type.startswith(_WRITE_PATH_PREFIXES) or command_type == "open_document"):
+        return None
+    for k, v in (params or {}).items():
+        if k.lower() in _PATH_KEYS and isinstance(v, str):
+            root = _under_denied_root(v)
+            if root:
+                return {"error": f"refused: {command_type} would write to or open "
+                                 f"from the protected location {root} ({v}). "
+                                 "Copy the file to a local folder first.",
+                        "code": "PATH_DENIED"}
+    return None
+
+
+_AUDIT_MAX = 5 * 1024 * 1024
+
+
+def _audit(rec):
+    """Append one line to ipc/audit.jsonl (rotated at 5 MB)."""
+    base = _plugin_dir()
+    if not base:
+        return
+    path = os.path.join(base, "ipc", "audit.jsonl")
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > _AUDIT_MAX:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _route(command_type, params, document):
+    """Decide target document + priority; enforce locks. Returns (meta, error)."""
+    sid, agent = _session_info()
+    with _coord_lock:
+        binding = _sessions.get(sid) if sid else None
+        if binding is not None:
+            binding["last"] = time.time()
+        doc = document or (binding or {}).get("doc")
+        prio = (binding or {}).get("prio", _PRIO["interactive"])
+        key = _doc_key(doc)
+        if key and not _is_readonly(command_type):
+            lk = _locks.get(key)
+            if lk and lk["until"] < time.time():
+                _locks.pop(key, None)
+                lk = None
+            if lk and lk["sid"] != sid:
+                return None, {"error": f"{doc} is locked by {lk.get('agent') or 'another agent'} "
+                                       f"until {time.strftime('%H:%M:%S', time.localtime(lk['until']))} "
+                                       f"({lk.get('reason') or 'no reason given'}). Reads are allowed; "
+                                       "writes wait for unlock_document or the lock expiry.",
+                              "code": "DOC_LOCKED"}
+    meta = {"_prio": prio}
+    free = (command_type in _DOC_FREE
+            or (command_type in _DOC_FREE_WITH_FILE and (params or {}).get("file_path")))
+    if free and not document:
+        meta["_free"] = 1                 # run in whatever document is in front
+    elif doc:
+        meta["_doc"] = doc
+    if sid:
+        meta["_session"] = sid[:16]
+    if agent:
+        meta["_agent"] = agent[:60]
+    return meta, None
+
+
+def cmd(command_type, params=None, document=None):
+    """Send command and return JSON string.
+
+    Compact separators, not indent=2. Every tool returns through here, so the
+    indentation was paid on every result of every call — measured at 13-22% of
+    the payload depending on nesting depth. ensure_ascii=False keeps German
+    layer, class and plant names (Winkelstützen, Grünfläche) as real characters
+    instead of \\uXXXX escapes, which is both shorter and readable.
+
+    document: target document for this one call (base name or full path);
+    overrides the session binding from use_document.
+    """
+    t0 = time.perf_counter()
+    result = _path_violation(command_type, params)
+    meta = None
+    if result is None:
+        meta, result = _route(command_type, params, document)
+    if result is None:
+        result = get_vwx_connection().send_command(command_type, params, meta)
+    rec = {"ts": round(time.time(), 3), "cmd": command_type,
+           "ms": round((time.perf_counter() - t0) * 1000),
+           "doc": (meta or {}).get("_doc"), "prio": (meta or {}).get("_prio"),
+           "session": (meta or {}).get("_session"), "agent": (meta or {}).get("_agent"),
+           "status": ("err" if isinstance(result, dict) and result.get("error") else "ok"),
+           "code": result.get("code") if isinstance(result, dict) else None}
+    if command_type == "execute_script":
+        code = str((params or {}).get("code", ""))
+        rec["script_head"] = code[:160]
+        rec["script_len"] = len(code)
+    _audit(rec)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def _member_box_fallback_eligible(profile: str,
@@ -463,21 +828,32 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 mcp = FastMCP(
     "vwx-mcp",
     instructions=(
-        "Vectorworks 2026 integration via MCP. Three access layers: "
-        "(1) explicit @tool wrappers for the most common verbs; "
-        "(2) `vwx(command, params)` generic dispatcher — reaches every function "
-        "in the bridge's commands.py (use `list_commands` to discover); "
-        "(3) `execute_script` for arbitrary vs.* Python. "
-        "Conventions: object IDs are UUID strings (vs.GetObjectUuid); "
-        "coordinates/distances are in DOCUMENT units (check get_document_units), "
-        "y grows up, angles in degrees; results are JSON with either "
-        "{status:'ok', ...} or {error:'...'}. "
-        "Speed: use `vwx_batch` for many calls in one round-trip. "
-        "Accuracy: call `vs_signature(name)` BEFORE writing execute_script "
-        "bodies — the knowledge index has the exact signature of all 3071 vs.* "
-        "functions, so scripts run right the first time. "
-        "Criteria strings power bulk ops: criteria_count / select_by_criteria / "
-        "for_each_criteria with e.g. \"(T=RECT)\" or \"(L='Layer-1')\"."
+        "Drives a LIVE Vectorworks desktop session — the user's open drawing, "
+        "edited in place. Search these tools for anything about: CAD or BIM "
+        "drawings, .vwx documents, layers/classes/sheet layers/viewports, "
+        "symbols and plug-in objects, walls slabs roofs and their components, "
+        "2D geometry and 3D solids/NURBS, hatches and materials and textures, "
+        "worksheets and reports, IFC export and property sets, DIN 276 cost "
+        "groups, site models and terrain, GIS georeferencing, and landscape "
+        "work — planting plans, plant records, Baumkataster tree inventories.\n"
+        "Three access layers, widest last: (1) explicit verbs for common "
+        "operations; (2) `vwx(command, params)` reaches every function in the "
+        "bridge — `list_commands(filter)` to discover; (3) `execute_script` "
+        "runs arbitrary vs.* Python inside VW.\n"
+        "Conventions: object IDs are UUID strings; coordinates and distances "
+        "are in DOCUMENT units (`get_document_units`), y grows up, angles in "
+        "degrees. Results are JSON, either {status:'ok',...} or {error:'...'}.\n"
+        "Speed: `vwx_batch` runs many commands in ONE round-trip — each "
+        "separate call costs a fixed bridge crossing, so batch aggressively.\n"
+        "Accuracy: call `vs_signature(name)` BEFORE writing an execute_script "
+        "body. The index carries exact signatures for all 3098 vs.* functions, "
+        "so a script runs right the first time instead of tripping a VW engine "
+        "error on arity.\n"
+        "Bulk work goes through criteria strings — criteria_count / "
+        "select_by_criteria / for_each_criteria with e.g. \"(T=RECT)\" or "
+        "\"(L='Layer-1')\" — not per-object loops.\n"
+        "Live document state is also available as resources under vwx:// "
+        "without spending a tool call."
     ),
     lifespan=server_lifespan,
 )
@@ -488,20 +864,148 @@ mcp = FastMCP(
 # at registration (by function name), so the fastmcp Visibility API (mcp.enable/
 # disable(tags=...)) can filter the toolset by workflow preset — see main().
 from tool_tags import TOOL_TAGS
+from mcp.types import ToolAnnotations
+
+# ── Tool classification ────────────────────────────────────────────
+# Read-only means: touches no document state at all — no creation, no mutation,
+# no selection change, no active layer/class switch, no dialog, no redraw.
+# This is the SAME contract the in-VW pump uses to decide whether a job may
+# drain in the crash-prone OnIdle notification context, so the two must agree.
+# The pump previously decided on its own by name prefix; the server now exports
+# this set to the plugin dir at startup (see _export_readonly_manifest) so the
+# classification has one owner instead of two heuristics that can drift apart.
+_RO_NAMES = frozenset({
+    "ping", "distance", "distance_3d", "polygon_centroid",
+    "get_document_info", "get_document_preferences", "get_georeferencing",
+    "vs_signature", "vs_index_stats", "list_commands", "criteria_count",
+    "eval_expression", "three_point_center",
+})
+_RO_PREFIXES = ("get_", "list_", "count_", "find_")
+
+# Destructive means: removes or irreversibly rewrites existing document
+# content. Not merely 'writes' — create_* and draw_* are additive and are
+# deliberately NOT in here, so they keep normal permission handling.
+_DESTRUCTIVE_PREFIXES = ("delete_", "remove_", "clear_", "purge_")
+_DESTRUCTIVE_NAMES = frozenset({
+    "subtract_solid", "clip_surface", "add_hole", "delete_component",
+    "delete_all_components", "delete_poly_vertex", "save_document_as",
+})
+
+# Pinned into client context permanently instead of being discovered on demand.
+# With tool-search deferral the client loads only tool NAMES up front; these six
+# are the three access layers (explicit verb -> generic dispatcher -> raw
+# script) plus discovery, and between them they can already reach everything.
+# Keeping them resident means the first call of a session never costs a search
+# round-trip. Everything else stays deferred — that is the point.
+_ALWAYS_LOAD = frozenset({
+    "ping", "vwx", "vwx_batch", "list_commands", "vs_signature",
+    "execute_script",
+    # screenshot earns its place: it is the only tool that can tell whether the
+    # drawing actually looks right, and an agent that has to go searching for
+    # it will simply not think to look.
+    "screenshot",
+})
+
+# Tools whose honest output is large. Without this annotation a result over the
+# client's default threshold is written to disk and replaced in the
+# conversation by a file reference — which is why broad reads sometimes come
+# back as a path instead of data. Ceiling is 500_000 characters.
+_MAX_RESULT_CHARS = {
+    "list_commands": 200_000,
+    "vs_signature": 150_000,
+    "vwx_batch": 300_000,
+    "get_objects": 250_000,
+    "get_selected_objects": 250_000,
+    "get_worksheet_data": 250_000,
+    "get_object_records": 200_000,
+    "get_plants": 250_000,
+    "get_layers": 120_000,
+    "get_classes": 120_000,
+    "get_symbols": 150_000,
+    "get_materials": 120_000,
+    "get_textures": 120_000,
+    "get_record_formats": 120_000,
+    "for_each_criteria": 250_000,
+}
+
+READONLY_TOOLS = set()      # filled by vtool() as tools register
+
+
+def _is_readonly(name):
+    return name in _RO_NAMES or name.startswith(_RO_PREFIXES)
+
+
+def _is_destructive(name):
+    return (name in _DESTRUCTIVE_NAMES
+            or name.startswith(_DESTRUCTIVE_PREFIXES))
 
 
 def vtool(fn=None, **kwargs):
-    """@vtool + declarative tag from TOOL_TAGS[fn.__name__] + native per-call timeout."""
+    """@vtool + declarative tag, per-call timeout, MCP annotations and client meta.
+
+    Everything here is derived from the function name at registration time, so
+    adding a tool stays a one-decorator affair — no parallel table to update.
+    """
     def deco(f):
+        name = f.__name__
         kwargs.setdefault("output_schema", None)
         kwargs.setdefault("timeout", VWX_CALL_TIMEOUT)   # native fastmcp 3.x per-tool timeout
-        if VWX_TASKS and _TASKS_AVAILABLE and f.__name__ in _TASK_TOOLS:
+        if VWX_TASKS and _TASKS_AVAILABLE and name in _TASK_TOOLS:
             kwargs.setdefault("task", True)              # opt-in MCP Tasks for long-running tools
-        tag = TOOL_TAGS.get(f.__name__)
+        tag = TOOL_TAGS.get(name)
         if tag:
             kwargs["tags"] = set(kwargs.get("tags") or set()) | {tag}
+
+        readonly = _is_readonly(name)
+        if readonly:
+            READONLY_TOOLS.add(name)
+        # Every tool reaches a live Vectorworks document, never a third-party
+        # service, so openWorldHint is False across the board.
+        kwargs.setdefault("annotations", ToolAnnotations(
+            readOnlyHint=readonly,
+            destructiveHint=_is_destructive(name),
+            idempotentHint=readonly,
+            openWorldHint=False,
+        ))
+
+        # meta is a single dict on mcp.tool(), not additive — merge rather than
+        # setdefault, or a tool that passes its own meta= silently loses it.
+        injected = {}
+        if name in _ALWAYS_LOAD:
+            injected["anthropic/alwaysLoad"] = True
+        if name in _MAX_RESULT_CHARS:
+            injected["anthropic/maxResultSizeChars"] = _MAX_RESULT_CHARS[name]
+        if injected:
+            kwargs["meta"] = {**injected, **(kwargs.get("meta") or {})}
+
         return mcp.tool(**kwargs)(f)
     return deco(fn) if callable(fn) else deco
+
+
+def _export_readonly_manifest():
+    """Write the read-only tool set where the in-VW pump can read it.
+
+    The pump must never run a mutating command in the OnIdle notification
+    context (verified to crash Vectorworks). It decided what was safe by name
+    prefix alone — an unenforced convention that a single carelessly named
+    future command would violate silently. Audited today: 0 of 70 prefix-
+    matching commands actually mutate, so this is a latent gap rather than a
+    live bug — but it costs nothing to close it. The pump prefers this manifest
+    and falls back to its own prefixes when it is absent.
+    """
+    base = _plugin_dir()
+    if not base:
+        return
+    try:
+        path = os.path.join(base, 'ipc', 'readonly.json')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(sorted(READONLY_TOOLS), fh)
+        os.replace(tmp, path)
+        logger.info(f"exported {len(READONLY_TOOLS)} read-only tool names to {path}")
+    except Exception as e:
+        logger.warning(f"could not export the read-only manifest: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -542,6 +1046,233 @@ def save_document(ctx: Context) -> str:
 def save_document_as(ctx: Context, path: str) -> str:
     """Save document to a new path (absolute .vwx path)"""
     return cmd("save_document_as", {"path": path})
+
+@vtool
+def list_documents(ctx: Context) -> str:
+    """List every open Vectorworks document and which one commands land in.
+
+    VectorScript cannot see past the active document — there is no
+    GetDocumentCount and no NextDocument. This reads the window list of the
+    Vectorworks process instead, so it works with several files open at once.
+    """
+    return cmd("list_documents")
+
+@vtool
+def switch_document(ctx: Context, name: str = None, hwnd: int = None) -> str:
+    """Bring another open document to the front, by file name or window handle.
+
+    With more than one agent, prefer use_document (or document= on vwx /
+    execute_script): switching the front document here changes it for every
+    agent that has not bound itself to a document.
+
+    QUEUED, NOT DONE: the switch takes effect after the call returns, so this
+    answer reports what was asked for, not what happened. Confirm with
+    confirm_active_document as the next call before writing anything — a
+    write in the wrong document is the expensive mistake here. Partial names
+    are accepted while unique; an ambiguous match (same base name, different
+    folder) is reported with candidate window handles instead of guessing.
+    """
+    p = {}
+    if name: p["name"] = name
+    if hwnd: p["hwnd"] = hwnd
+    return cmd("switch_document", p)
+
+# ── v14 coordination: several agents in one Vectorworks ─────────────────────
+
+def _open_docs():
+    try:
+        r = get_vwx_connection().send_command("list_documents", {}, {"_free": 1, "_prio": 1})
+    except Exception as e:
+        return None, str(e)
+    if not isinstance(r, dict) or r.get("error"):
+        return None, (r or {}).get("error") if isinstance(r, dict) else str(r)
+    return r, None
+
+
+def _doc_open(docs, document):
+    key = _doc_key(document)
+    return any(_doc_key(d.get("datei")) == key for d in (docs or {}).get("dokumente", []))
+
+
+@vtool
+def use_document(ctx: Context, document: Optional[str] = None,
+                 priority: str = "interactive") -> str:
+    """Bind THIS agent session to one open document (file name or full path).
+
+    Every later call of this session — explicit tools, vwx, vwx_batch,
+    execute_script — runs in that document, no matter which document the user
+    or another agent has in front. The bridge activates it, verifies it, runs
+    the job, and brings the user's document back when the queue is done. Call
+    with no document to unbind (calls then go to the user's active document
+    again). priority: interactive (default) | batch | background — batch work
+    yields to interactive calls of other agents. Use this INSTEAD of
+    switch_document whenever more than one agent may be working."""
+    if priority not in _PRIO:
+        return json.dumps({"error": f"priority must be one of {sorted(_PRIO)}"})
+    sid, agent = _session_info()
+    if not sid:
+        return json.dumps({"error": "no MCP session id — binding needs the HTTP transport"})
+    if document:
+        docs, err = _open_docs()
+        if err:
+            return json.dumps({"error": err})
+        if not _doc_open(docs, document):
+            return json.dumps({"error": f"{document} is not open in Vectorworks",
+                               "code": "DOC_NOT_OPEN",
+                               "offen": [d.get("datei") for d in docs.get("dokumente", [])],
+                               "hint": "open it with open_document(path) first"},
+                              ensure_ascii=False)
+    with _coord_lock:
+        if document:
+            _sessions[sid] = {"doc": document, "prio": _PRIO[priority], "agent": agent,
+                              "since": time.time(), "last": time.time()}
+        else:
+            _sessions.pop(sid, None)
+    return json.dumps({"status": "ok", "session": sid[:16], "document": document,
+                       "priority": priority}, ensure_ascii=False)
+
+
+@vtool
+def lock_document(ctx: Context, document: str, minutes: float = 15,
+                  reason: str = "") -> str:
+    """Reserve WRITE access to one document for this session (cooperative lock).
+
+    Other agents can still read it; their writes get DOC_LOCKED until you call
+    unlock_document or the lock expires (default 15 min, renew by calling
+    again). Take a lock before a multi-step build so nobody edits in between."""
+    sid, agent = _session_info()
+    key = _doc_key(document)
+    if not key:
+        return json.dumps({"error": "document required"})
+    with _coord_lock:
+        lk = _locks.get(key)
+        if lk and lk["sid"] != sid and lk["until"] > time.time():
+            return json.dumps({"error": f"already locked by {lk.get('agent')}",
+                               "code": "DOC_LOCKED", "until": lk["until"]})
+        _locks[key] = {"sid": sid, "agent": agent, "doc": document, "reason": reason,
+                       "until": time.time() + max(1.0, float(minutes)) * 60}
+    return json.dumps({"status": "ok", "document": document,
+                       "until": time.strftime("%H:%M:%S", time.localtime(_locks[key]["until"]))},
+                      ensure_ascii=False)
+
+
+@vtool
+def unlock_document(ctx: Context, document: str) -> str:
+    """Release a lock taken with lock_document (only the holder can release)."""
+    sid, _agent = _session_info()
+    key = _doc_key(document)
+    with _coord_lock:
+        lk = _locks.get(key)
+        if not lk:
+            return json.dumps({"status": "ok", "note": "was not locked"})
+        if lk["sid"] != sid and lk["until"] > time.time():
+            return json.dumps({"error": f"locked by {lk.get('agent')}, not by this session",
+                               "code": "DOC_LOCKED"})
+        _locks.pop(key, None)
+    return json.dumps({"status": "ok", "document": document}, ensure_ascii=False)
+
+
+@vtool
+def get_bridge_status(ctx: Context, audit_lines: int = 20) -> str:
+    """Who is doing what: queued jobs per document/agent, bindings, locks, the
+    bridge's document routing state and the last audit entries. Read-only,
+    answered by the server without a Vectorworks round-trip."""
+    base = _plugin_dir()
+    out = {"status": "ok"}
+    try:
+        t = get_vwx_connection()
+        alive, paused, age = t.bridge_state() if hasattr(t, "bridge_state") else (None, None, None)
+        out["bridge"] = {"alive": alive, "paused": paused,
+                         "heartbeat_age_s": None if age in (None, float("inf")) else round(age, 1)}
+    except Exception as e:
+        out["bridge"] = {"error": str(e)}
+    queued = []
+    if base:
+        jd = os.path.join(base, "ipc", "jobs")
+        for fn in sorted(os.listdir(jd)) if os.path.isdir(jd) else []:
+            if not fn.endswith(".json") or fn.startswith("wake-"):
+                continue                  # wake-* = the pump's restore-delay marker
+            try:
+                with open(os.path.join(jd, fn), encoding="utf-8") as fh:
+                    j = json.load(fh)
+                queued.append({"cmd": j.get("type"), "doc": j.get("_doc"), "prio": j.get("_prio"),
+                               "agent": j.get("_agent"), "age_s": round(time.time() - j.get("ts", time.time()), 1)})
+            except Exception:
+                pass
+        try:
+            with open(os.path.join(base, "ipc", "docstate.json"), encoding="utf-8") as fh:
+                out["routing"] = json.load(fh)
+        except Exception:
+            out["routing"] = {}
+        try:
+            with open(os.path.join(base, "ipc", "audit.jsonl"), encoding="utf-8") as fh:
+                out["audit"] = [json.loads(l) for l in fh.readlines()[-max(0, int(audit_lines)):]]
+        except Exception:
+            out["audit"] = []
+    out["queued"] = queued
+    now = time.time()
+    with _coord_lock:
+        for sid in [s for s, b in _sessions.items() if now - b.get("last", now) > 4 * 3600]:
+            _sessions.pop(sid, None)
+        out["sessions"] = [{"session": s[:16], "agent": b.get("agent"), "doc": b.get("doc"),
+                            "prio": b.get("prio")} for s, b in _sessions.items()]
+        out["locks"] = [{"doc": l.get("doc"), "agent": l.get("agent"), "reason": l.get("reason"),
+                         "until": time.strftime("%H:%M:%S", time.localtime(l["until"]))}
+                        for l in _locks.values() if l["until"] > now]
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+
+@vtool
+def open_document(ctx: Context, path: str, wait_s: float = 180) -> str:
+    """Open a .vwx in the running Vectorworks (no clicking) and wait until it
+    shows up as an open document. Refuses files on the protected office share
+    (copy them locally first — VW converts old versions and asks to save on
+    close). Pair with use_document to work in it, close_document when done."""
+    if not path or not path.lower().endswith(".vwx"):
+        return json.dumps({"error": "path to a .vwx file required"})
+    bad = _path_violation("open_document", {"path": path})
+    if bad:
+        return json.dumps(bad, ensure_ascii=False)
+    if not os.path.isfile(path):
+        return json.dumps({"error": f"file not found: {path}"}, ensure_ascii=False)
+    docs, err = _open_docs()
+    if docs and _doc_open(docs, path):
+        return json.dumps({"status": "ok", "document": os.path.basename(path),
+                           "note": "already open"}, ensure_ascii=False)
+    before = (docs or {}).get("aktiv")
+    try:
+        os.startfile(path)          # the shell hands it to the running VW instance
+    except Exception as e:
+        return json.dumps({"error": f"could not hand the file to Windows: {e}"})
+    deadline = time.monotonic() + max(5.0, float(wait_s))
+    while time.monotonic() < deadline:
+        time.sleep(2.0)
+        docs, err = _open_docs()
+        if docs and _doc_open(docs, path):
+            # Vectorworks puts a freshly opened file in FRONT. Untargeted calls
+            # (the user, unbound agents) would land in it. Give the front back
+            # to whatever was there before — the opener reaches its file through
+            # use_document / document= anyway.
+            if before and _doc_key(before) != _doc_key(path):
+                get_vwx_connection().send_command("switch_document", {"name": before},
+                                                  {"_free": 1, "_prio": 1})
+            _audit({"ts": round(time.time(), 3), "cmd": "open_document", "doc": path, "status": "ok"})
+            return json.dumps({"status": "ok", "document": os.path.basename(path),
+                               "front_restored_to": before}, ensure_ascii=False)
+    return json.dumps({"error": f"{os.path.basename(path)} did not appear within {wait_s:.0f}s "
+                                "(large file still loading, or a dialog in Vectorworks waits "
+                                "for an answer — check with screenshot)",
+                       "code": "DOC_OPEN_TIMEOUT"}, ensure_ascii=False)
+
+
+@vtool
+def close_document(ctx: Context, document: str, save: bool = True) -> str:
+    """Close one open document (by file name or path). save=True saves first
+    (no dialog); save=False only closes a document without unsaved changes —
+    otherwise Vectorworks would ask, so it is refused. Never closes the
+    document the user is working in unless you name it."""
+    return cmd("close_document", {"save": save}, document=document)
+
 
 @vtool
 def get_document_preferences(ctx: Context) -> str:
@@ -646,12 +1377,17 @@ def rename_class(ctx: Context, old_name: str, new_name: str) -> str:
 @vtool
 def set_class_appearance(ctx: Context, name: str, fill_r: int = None, fill_g: int = None, fill_b: int = None,
                          pen_r: int = None, pen_g: int = None, pen_b: int = None,
-                         line_weight: float = None) -> str:
-    """Set class fill/pen color (0-255 RGB) and line weight in mm"""
+                         line_weight: float = None, fill_pattern: int = None,
+                         line_style: int = None, opacity: float = None,
+                         hatch: str = None) -> str:
+    """Set class fill/pen color (0-255 RGB), line weight (mm), fill pattern index,
+    line style index, opacity (0-100 percent, 100=fully opaque) and/or hatch name.
+    Every argument is optional; only fields you pass are touched."""
     p = {"name": name}
     for k, v in {"fill_r": fill_r, "fill_g": fill_g, "fill_b": fill_b,
                  "pen_r": pen_r, "pen_g": pen_g, "pen_b": pen_b,
-                 "line_weight": line_weight}.items():
+                 "line_weight": line_weight, "fill_pattern": fill_pattern,
+                 "line_style": line_style, "opacity": opacity, "hatch": hatch}.items():
         if v is not None: p[k] = v
     return cmd("set_class_appearance", p)
 
@@ -1977,10 +2713,17 @@ def export_dxf(ctx: Context, path: str) -> str:
     return cmd("export_dxf", {"path": path})
 
 @vtool
-def export_image(ctx: Context, path: str, width: int = 2000, height: int = 1500,
+def export_image(ctx: Context, path: str, object_id: Optional[str] = None,
+                 width: int = 2000, height: int = 1500,
                  dpi: int = 150, format: str = "png") -> str:
-    """Export current view to image. format: png/jpg/tif"""
-    return cmd("export_image", {"path": path, "width": width, "height": height,
+    """Export an Image OBJECT in the document to a file (pass its object_id).
+
+    This canNOT rasterize the drawing itself — VW2026 has no headless
+    render-to-file API. To see what the drawing looks like use `screenshot`;
+    for a vector deliverable use `export_pdf`. Called without object_id this
+    returns an explanatory error rather than silently writing nothing."""
+    return cmd("export_image", {"path": path, "object_id": object_id,
+                                "width": width, "height": height,
                                 "dpi": dpi, "format": format})
 
 @vtool
@@ -2088,12 +2831,17 @@ def apply_texture(ctx: Context, object_id: str, texture_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @vtool
-def execute_script(ctx: Context, code: str) -> str:
+def execute_script(ctx: Context, code: str, allow_handle_walk: bool = False,
+                   document: Optional[str] = None) -> str:
     """Execute arbitrary vs.* Python code inside Vectorworks.
     Code runs on VW main thread. Use __result__ to return a value.
     Example: '__result__ = vs.GetDocumentName()'
-    All vs.* functions available. Stdout captured in 'output' key."""
-    return cmd("execute_script", {"code": code})
+    All vs.* functions available. Stdout captured in 'output' key.
+    document: run in this open document (file name or full path) instead of
+    the session's bound / the user's active one — the bridge brings it to the
+    front, verifies it, runs, and later restores the user's document."""
+    return cmd("execute_script", {"code": code, "allow_handle_walk": allow_handle_walk},
+               document=document)
 
 @vtool
 def run_menu_command(ctx: Context, menu_name: str) -> str:
@@ -2106,7 +2854,8 @@ def run_menu_command(ctx: Context, menu_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @vtool
-def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None) -> str:
+def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None,
+        document: Optional[str] = None) -> str:
     """Generic VWX command dispatcher.
 
     Calls ANY function defined in the bridge's commands.py by name. The bridge
@@ -2114,20 +2863,23 @@ def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None) -> 
     immediately. Use `list_commands(filter)` to discover what's available —
     typical examples: `vwx('create_pio', {'name':'Door','x':0,'y':0})`,
     `vwx('offset_polygon', {'object_id':uuid,'distance':500})`,
-    `vwx('send_to_surface', {'object_id':uuid})`, `vwx('list_components', {...})`."""
-    return cmd(command, params or {})
+    `vwx('send_to_surface', {'object_id':uuid})`, `vwx('list_components', {...})`.
+    document: target open document for this call (see use_document)."""
+    return cmd(command, params or {}, document=document)
 
 @vtool
 def vwx_batch(ctx: Context, calls: List[Dict[str, Any]],
-              fail_fast: bool = False) -> str:
-    """Run multiple VWX commands in one round-trip.
+              fail_fast: bool = False,
+              document: Optional[str] = None) -> str:
+    """Run multiple VWX commands in one round-trip (saves socket + main-thread trips).
 
     Later params can consume earlier results with {"$ref":"0.object_id"}.
     `fail_fast` stops after the first reference/dispatch/command error. This is
     orchestration, not an atomic transaction; use guarded compound commands
     when rollback is required.
-    """
-    return cmd("_batch", {"calls": calls, "fail_fast": fail_fast})
+    calls: [{'command': str, 'params': dict}, ...]. Returns list of results in order.
+    document: run the whole batch in this open document (see use_document)."""
+    return cmd("_batch", {"calls": calls, "fail_fast": fail_fast}, document=document)
 
 @vtool
 def list_commands(ctx: Context, filter: Optional[str] = None) -> str:
@@ -2139,8 +2891,8 @@ def list_commands(ctx: Context, filter: Optional[str] = None) -> str:
 @vtool
 def vs_signature(ctx: Context, name: Optional[str] = None,
                  search: Optional[str] = None, category: Optional[str] = None) -> str:
-    """Exact VW2026 signature of a `vs.*` function from the knowledge index
-    (3071 functions). Pass `name` for one function (args, arity, return type,
+    """Exact Vectorworks signature of a `vs.*` function from the knowledge index
+    (3098 functions, SDK 2027). Pass `name` for one function (args, arity, return type,
     category, doc), or `search`/`category` to browse. Use this BEFORE writing an
     `execute_script` body so you never guess an arg count and trip a VW engine
     error. Example: vs_signature(name='HExtrude') -> objectH, bottom, top."""
@@ -2666,10 +3418,13 @@ def ifc_remove_pset(ctx: Context, object_id: str, pset: Optional[str] = None) ->
     return cmd("ifc_remove_pset", p)
 
 @vtool
-def ifc_define_pset(ctx: Context, name: str, members: List[Dict[str, str]]) -> str:
+def ifc_define_pset(ctx: Context, name: str, members: List[Dict[str, str]],
+                     ersetzen: bool = True) -> str:
     """Define a custom pset schema (document-wide). members=[{name, type}],
-    type: 'IfcLabel' | 'IfcReal' | 'IfcBoolean' | 'IfcLengthMeasure' ..."""
-    return cmd("ifc_define_pset", {"name": name, "members": members})
+    type: 'IfcLabel' | 'IfcReal' | 'IfcBoolean' | 'IfcLengthMeasure' ...
+    ersetzen=False aborts with an error instead of overwriting an existing
+    pset of the same name (default True keeps the old overwrite behavior)."""
+    return cmd("ifc_define_pset", {"name": name, "members": members, "ersetzen": ersetzen})
 
 @vtool
 def ifc_get_entity_prop(ctx: Context, object_id: str, prop: str) -> str:
@@ -3085,8 +3840,732 @@ def _init_otel():
         return False
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Visual verification — see the drawing, don't just read about it
+# ═══════════════════════════════════════════════════════════════════
+# Every other tool answers in JSON: an agent can confirm that an object exists
+# and where its bounding box is, but not that the drawing LOOKS right. Geometry
+# that is silently wrong — overlapping hatches, a plant at the wrong scale, a
+# viewport showing the wrong layer — reads as {"status":"ok"} all the way.
+#
+# Deliberately NOT routed through the bridge. Vectorworks has no headless
+# render-to-file API at all: vs.ExportImageFile(hImage, filePath) takes an
+# Image OBJECT handle, not the drawing, and the menu-driven export opens a
+# modal dialog. Capturing the window from the server side instead means no job
+# file, no main-thread dispatch, no execution-context risk, and it works while
+# Vectorworks is unfocused or occluded.
+
+_VW_PROC_PREFIX = "Vectorworks"
+
+
+def _vw_windows():
+    """Vectorworks' visible top-level windows, split into document and dialogs.
+
+    Returns (document, dialogs) where each entry is (hwnd, title, area).
+
+    Several Vectorworks processes run at once — cloud services, helper
+    instances, the error handler — and most own no window at all. Of the ones
+    that do, an owned window is a dialog and an unowned one is the document
+    frame. That distinction matters twice over: picking the first match blindly
+    captures whatever dialog happens to be up (the first live run of this tool
+    returned the plug-in security dialog instead of the drawing), and an open
+    modal is itself the explanation for every command that is timing out.
+    """
+    import ctypes
+    from ctypes import wintypes
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    doc, dialogs = [], []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _):
+        if not u32.IsWindowVisible(hwnd):
+            return True
+        n = u32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u32.GetWindowTextW(hwnd, buf, n + 1)
+        pid = wintypes.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = k32.OpenProcess(0x1000, False, pid.value)     # LIMITED_INFORMATION
+        if not h:
+            return True
+        try:
+            size = wintypes.DWORD(260)
+            name = ctypes.create_unicode_buffer(size.value)
+            if not k32.QueryFullProcessImageNameW(h, 0, name, ctypes.byref(size)):
+                return True
+            exe = os.path.basename(name.value)
+            if not exe.startswith(_VW_PROC_PREFIX) or "Cloud" in exe \
+                    or "error_handler" in exe:
+                return True
+        finally:
+            k32.CloseHandle(h)
+        # Floating palettes (the VWX Bridge palette, tool palettes) are owned
+        # windows too, but they are not dialogs: their MFC class is
+        # BCGPMiniFrame/BCGP*. Treating them as modal returned a 20 px title
+        # bar as "the dialog" and told the model to close the bridge itself
+        # (2026-09-11). Real VW dialogs are #32770 or Afx dialog classes.
+        cls = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(hwnd, cls, 64)
+        if cls.value.startswith("BCGP"):
+            return True
+        rect = wintypes.RECT()
+        u32.GetWindowRect(hwnd, ctypes.byref(rect))
+        area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+        entry = (hwnd, buf.value, area)
+        owner = u32.GetWindow(hwnd, 4)                               # GW_OWNER
+        if not owner:
+            doc.append(entry)
+        # A modal disables its owner — that is what makes it modal. Any other
+        # owned window (overlay, tooltip, palette under a class name not
+        # listed above) leaves the frame usable and is ignored, never
+        # captured in place of the drawing.
+        elif not u32.IsWindowEnabled(owner):
+            dialogs.append(entry)
+        return True
+
+    u32.EnumWindows(_cb, 0)
+    doc.sort(key=lambda e: e[2], reverse=True)      # the frame is the big one
+    return (doc[0] if doc else None), dialogs
+
+
+def _dialog_details(hwnd, title):
+    """What a modal dialog says and which buttons it offers.
+
+    Standard Win32 dialogs (#32770 — the warning/question boxes VW raises,
+    e.g. "Die ausgewählte Einfassung ist mit einem Belag/Weg verknüpft …")
+    expose their message as Static children and their choices as Button
+    children, so both can be read without touching the dialog. Custom-drawn
+    dialogs have no readable children; then only the title is known and the
+    caller should look at it with the screenshot tool.
+    """
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    texts, buttons = [], []
+
+    def _txt(h):
+        n = u32.GetWindowTextLengthW(h)
+        if n <= 0:
+            return ""
+        b = ctypes.create_unicode_buffer(n + 1)
+        u32.GetWindowTextW(h, b, n + 1)
+        return b.value
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _child(h, _):
+        if not u32.IsWindowVisible(h):
+            return True
+        cls = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(h, cls, 64)
+        t = _txt(h).strip()
+        if not t:
+            return True
+        if cls.value == "Button":
+            style = u32.GetWindowLongW(h, -16) & 0x0F          # BS_TYPEMASK
+            # check boxes, radio buttons and group boxes are options, not
+            # answers; everything else is a push button — VW draws its own
+            # (BS_OWNERDRAW), so "only BS_PUSHBUTTON" missed its OK (13.10.)
+            if style in (2, 3, 4, 5, 6, 7, 9):
+                texts.append("[Option] " + t.replace("&", ""))
+            else:
+                buttons.append(t.replace("&", ""))
+        elif cls.value in ("Static", "Edit", "RichEdit20W", "RICHEDIT50W"):
+            texts.append(t)
+        return True
+
+    u32.EnumChildWindows(hwnd, _child, 0)
+    cls = ctypes.create_unicode_buffer(64)
+    u32.GetClassNameW(hwnd, cls, 64)
+    return {"title": title, "text": "\n".join(texts), "buttons": buttons,
+            "class": cls.value, "readable": bool(texts or buttons)}
+
+
+def _open_dialogs():
+    """Details of every modal dialog Vectorworks shows right now ([] if none)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        _doc, dialogs = _vw_windows()
+        return [_dialog_details(h, t) for h, t, _a in dialogs]
+    except Exception as e:                      # never let detection break a call
+        logger.warning(f"dialog detection failed: {e}")
+        return []
+
+
+def _dpi_aware():
+    """Make this process DPI-aware. Must run before ANY window measurement.
+
+    Without it Windows hands back virtualized coordinates on a scaled display,
+    and every rect and capture silently describes a smaller window than the one
+    on screen — producing a cropped image that looks plausible and is wrong.
+    """
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def _canvas_rect(hwnd):
+    """Screen rect of the drawing canvas inside the Vectorworks frame.
+
+    The full window is mostly chrome — ribbon, tool palettes, Object Info,
+    Navigation — so capturing it spends over half the image budget on UI that
+    never changes. Vectorworks is an MFC app: the document view is the large
+    child view inside MDIClient. Returns None when that cannot be found, so the
+    caller falls back to the whole window rather than guessing at insets.
+    """
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    mdi = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _find_mdi(h, _):
+        cls = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(h, cls, 64)
+        if cls.value == "MDIClient" and u32.IsWindowVisible(h):
+            mdi.append(h)
+            return False
+        return True
+
+    u32.EnumChildWindows(hwnd, _find_mdi, 0)
+    if not mdi:
+        return None
+
+    best = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _find_view(h, _):
+        if not u32.IsWindowVisible(h):
+            return True
+        r = wintypes.RECT()
+        u32.GetWindowRect(h, ctypes.byref(r))
+        best.append(((r.right - r.left) * (r.bottom - r.top), r))
+        return True
+
+    u32.EnumChildWindows(mdi[0], _find_view, 0)
+    if not best:
+        return None
+    return max(best, key=lambda e: e[0])[1]
+
+
+def _capture_window(hwnd, max_width, crop_to=None):
+    """PNG bytes of a window, captured without stealing focus.
+
+    SetProcessDPIAware() must come first. Without it, on a 200%-scaled display
+    Windows reports virtualized coordinates and the capture silently comes back
+    as the cropped top-left quadrant of the window — an image that looks
+    plausible and is wrong, which is the worst kind of bug in a tool whose whole
+    job is visual confirmation.
+
+    PrintWindow with PW_RENDERFULLCONTENT asks the window to redraw itself into
+    our buffer, so this works while Vectorworks is behind other windows. Screen
+    scraping would capture whatever happens to be on top — during one earlier
+    session that turned out to be Teams.
+    """
+    import ctypes
+    from ctypes import wintypes
+    from PIL import Image as PILImage
+
+    u32, gdi = ctypes.windll.user32, ctypes.windll.gdi32
+    _dpi_aware()
+
+    rect = wintypes.RECT()
+    u32.GetWindowRect(hwnd, ctypes.byref(rect))
+    w, h = rect.right - rect.left, rect.bottom - rect.top
+    if w <= 0 or h <= 0:
+        raise RuntimeError(f"window has no area ({w}x{h})")
+
+    src = u32.GetWindowDC(hwnd)
+    dst = gdi.CreateCompatibleDC(src)
+    bmp = gdi.CreateCompatibleBitmap(src, w, h)
+    gdi.SelectObject(dst, bmp)
+    try:
+        if not u32.PrintWindow(hwnd, dst, 2):            # PW_RENDERFULLCONTENT
+            u32.PrintWindow(hwnd, dst, 0)                # fall back to the classic path
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD),
+                        ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG),
+                        ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD)]
+
+        bi = BITMAPINFOHEADER()
+        bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bi.biWidth, bi.biHeight = w, -h                  # negative = top-down
+        bi.biPlanes, bi.biBitCount, bi.biCompression = 1, 32, 0
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi.GetDIBits(dst, bmp, 0, h, buf, ctypes.byref(bi), 0)
+        img = PILImage.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+    finally:
+        gdi.DeleteObject(bmp)
+        gdi.DeleteDC(dst)
+        u32.ReleaseDC(hwnd, src)
+
+    if crop_to is not None:
+        # crop_to is in screen coordinates; the bitmap starts at the window's
+        # top-left corner. Clamp, because a canvas partly off-screen or a
+        # stale rect would otherwise raise or produce an empty image.
+        box = (max(0, crop_to.left - rect.left), max(0, crop_to.top - rect.top),
+               min(w, crop_to.right - rect.left), min(h, crop_to.bottom - rect.top))
+        if box[2] - box[0] > 50 and box[3] - box[1] > 50:
+            img = img.crop(box)
+
+    if max_width and img.width > max_width:
+        img = img.resize((max_width, round(img.height * max_width / img.width)),
+                         PILImage.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    return out.getvalue(), img.width, img.height
+
+
+@vtool
+def screenshot(ctx: Context, max_width: int = 1400, fit_to_objects: bool = False,
+               region: str = "canvas", document: Optional[str] = None):
+    """SEE the Vectorworks drawing as an image, instead of reading JSON about it.
+
+    Use this to VERIFY visually after drawing, editing or changing a view —
+    geometry that is subtly wrong still reports {"status":"ok"}, and this is the
+    only tool that can catch that. Also use it when the user asks what something
+    looks like, or to check a render or viewport before exporting.
+
+    region: 'canvas' (default) crops to the drawing area, so none of the image
+    budget is spent on ribbon and palettes; 'window' keeps the whole frame, for
+    when the question is about the interface itself — which palette is open,
+    what the Object Info panel says, which tool is active.
+
+    fit_to_objects zooms the active layer to its contents first, so whatever was
+    just drawn is actually in frame (this changes the view, nothing else).
+    max_width trades detail for tokens — images are billed by area and are not
+    covered by the large-result annotation, so keep it modest unless detail
+    genuinely matters.
+
+    document (or this session's use_document binding): capture THAT document.
+    Vectorworks has a single drawing surface — a background document cannot be
+    photographed — so the bridge brings it to the front, holds it there for the
+    capture (max 10 s) and lets the user's document come back afterwards.
+    Without a document this shows whatever is in front."""
+    if sys.platform != "win32":
+        return "Screenshots need the Windows build (window capture is Win32)."
+
+    sid, _agent = _session_info()
+    with _coord_lock:
+        target_doc = document or (_sessions.get(sid) or {}).get("doc") if sid else document
+    if target_doc:
+        held = json.loads(cmd("_hold", {}, document=target_doc))
+        if isinstance(held, dict) and held.get("error"):
+            return f"Could not bring {target_doc} to the front: {held.get('error')}"
+        time.sleep(0.4)            # the switch landed; let VW finish its redraw
+    try:
+        return _screenshot_front(max_width, fit_to_objects, region)
+    finally:
+        if target_doc:
+            cmd("_release", {})
+
+
+def _screenshot_front(max_width, fit_to_objects, region):
+    _dpi_aware()                   # before any rect is measured, not after
+    doc, dialogs = _vw_windows()
+    if not doc and not dialogs:
+        return ("No Vectorworks window found — is Vectorworks running with a "
+                "document open?")
+
+    # An open modal is both the most useful thing to look at and the reason
+    # every other command is timing out, so it wins over the drawing and the
+    # fit is skipped (it could not run anyway).
+    # A minimized window has no pixels. Windows still answers GetWindowRect
+    # with a tiny off-screen rect, so the capture "succeeds" and returns a
+    # ~200x34 sliver of title bar — an image that is not obviously broken and
+    # tells the caller nothing. Refuse instead.
+    import ctypes
+    target = (max(dialogs, key=lambda e: e[2]) if dialogs else doc)
+    if target and ctypes.windll.user32.IsIconic(target[0]):
+        return ("Vectorworks is minimized, so there is nothing to capture. "
+                "Restore the window and call screenshot again.")
+
+    crop = None
+    if dialogs:
+        hwnd, title, _ = max(dialogs, key=lambda e: e[2])
+        note = ("Vectorworks is showing a modal dialog, which blocks every "
+                f"bridge command until it is answered: {title!r}"
+                + (f" (plus {len(dialogs) - 1} more)" if len(dialogs) > 1 else "")
+                + ". This is the dialog, not the drawing.")
+    else:
+        hwnd, title, _ = doc
+        note = None
+        if fit_to_objects:
+            cmd("run_menu_command", {"menu_name": "Fit to Objects"})
+            time.sleep(0.35)      # let VW finish redrawing before the capture
+        if region == "canvas":
+            crop = _canvas_rect(hwnd)
+            if crop is None:
+                note = ("Could not locate the drawing canvas, so this is the "
+                        "whole window including palettes.")
+
+    try:
+        png, w, h = _capture_window(hwnd, max_width, crop_to=crop)
+    except Exception as e:
+        return f"Capture failed: {e}"
+    logger.info(f"tool=screenshot window={title!r} {w}x{h} "
+                f"bytes={len(png)} dialogs={len(dialogs)}")
+
+    from fastmcp.utilities.types import Image
+    img = Image(data=png, format="png")
+    if not note:
+        return img
+    from fastmcp.tools import ToolResult
+    from mcp.types import TextContent
+    return ToolResult(content=[TextContent(type="text", text=note),
+                               img.to_image_content()])
+
+
+@vtool
+def vw_dialog(ctx: Context) -> str:
+    """READ the modal dialog(s) Vectorworks is showing right now.
+
+    A modal dialog blocks VW's main thread and with it every bridge command;
+    commands then come back with code VW_MODAL_DIALOG. This tool works
+    regardless (it reads the window from outside VW): title, message text and
+    the push buttons it offers. Empty list = no dialog open.
+    Custom-drawn dialogs may be unreadable ("readable": false) — look at them
+    with the screenshot tool."""
+    if sys.platform != "win32":
+        return json.dumps({"error": "only on Windows"})
+    return json.dumps({"dialogs": _open_dialogs()}, ensure_ascii=False)
+
+
+@vtool
+def vw_dialog_press(ctx: Context, button: str, title: Optional[str] = None) -> str:
+    """ANSWER a Vectorworks modal dialog by pressing one of its buttons.
+
+    button: the button label as vw_dialog lists it (case-insensitive, '&'
+    ignored), e.g. "OK", "Nein", "Abbrechen". Special value "close" sends
+    WM_CLOSE (like the X) for dialogs without readable buttons.
+    title: pick the dialog by (part of) its title when several are open.
+    Read the text first. Answer harmless notices yourself (OK on a warning,
+    Nein/Abbrechen on an unexpected question); anything that changes or
+    deletes data, saves, or discards work is the user's decision — ask.
+    Works while VW is blocked (Windows messages from outside, no mouse).
+    After the dialog closes, a command that was running continues; fetch
+    its result with the 'poll' command and its cid instead of re-running it."""
+    if sys.platform != "win32":
+        return json.dumps({"error": "only on Windows"})
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    _doc, dialogs = _vw_windows()
+    if title:
+        dialogs = [d for d in dialogs if title.lower() in d[1].lower()]
+    if not dialogs:
+        return json.dumps({"error": "kein passender Dialog offen"})
+    hwnd, dtitle, _a = max(dialogs, key=lambda e: e[2])
+    want = button.replace("&", "").strip().lower()
+    if want == "close":
+        u32.PostMessageW(hwnd, 0x0010, 0, 0)                     # WM_CLOSE
+        pressed = "close"
+    else:
+        hits = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _child(h, _):
+            cls = ctypes.create_unicode_buffer(64)
+            u32.GetClassNameW(h, cls, 64)
+            if cls.value == "Button" and u32.IsWindowVisible(h) and u32.IsWindowEnabled(h):
+                n = u32.GetWindowTextLengthW(h)
+                b = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(h, b, n + 1)
+                if b.value.replace("&", "").strip().lower() == want:
+                    hits.append(h)
+            return True
+
+        u32.EnumChildWindows(hwnd, _child, 0)
+        if not hits:
+            return json.dumps({"error": f"Knopf {button!r} nicht gefunden",
+                               "dialog": _dialog_details(hwnd, dtitle)}, ensure_ascii=False)
+        u32.PostMessageW(hits[0], 0x00F5, 0, 0)                  # BM_CLICK
+        pressed = button
+    for _ in range(30):                                          # bis 3 s warten
+        time.sleep(0.1)
+        if not u32.IsWindow(hwnd) or not u32.IsWindowVisible(hwnd):
+            break
+    still = _open_dialogs()
+    logger.info(f"tool=vw_dialog_press dialog={dtitle!r} button={pressed!r} "
+                f"remaining={len(still)}")
+    return json.dumps({"status": "ok", "dialog": dtitle, "pressed": pressed,
+                       "noch_offen": still}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Resources — live document state, readable without spending a tool call
+# ═══════════════════════════════════════════════════════════════════
+# Every one of these is a question an agent asks constantly while working
+# ("what units? which layer am I on? what classes exist?") and each answer was
+# costing a full tool call plus a bridge crossing. As resources a client can
+# pull them as context directly. All are read-only by construction — they drain
+# through the pump's OnIdle path and never reach document mutation.
+
+@mcp.resource("vwx://document", mime_type="application/json",
+              description="Open Vectorworks document: filename, path, units, scale, version")
+def resource_document() -> str:
+    return cmd("get_document_info")
+
+
+@mcp.resource("vwx://layers", mime_type="application/json",
+              description="All design layers in the open document with elevation and scale")
+def resource_layers() -> str:
+    return cmd("get_layers")
+
+
+@mcp.resource("vwx://classes", mime_type="application/json",
+              description="All classes in the open document with visibility and attributes")
+def resource_classes() -> str:
+    return cmd("get_classes")
+
+
+@mcp.resource("vwx://units", mime_type="application/json",
+              description="Document unit system — the unit every coordinate and distance is expressed in")
+def resource_units() -> str:
+    return cmd("get_document_units")
+
+
+@mcp.resource("vwx://georeferencing", mime_type="application/json",
+              description="Document georeferencing: EPSG code, projection, drawing-to-world offset")
+def resource_georeferencing() -> str:
+    return cmd("get_georeferencing")
+
+
+@mcp.resource("vwx://commands", mime_type="application/json",
+              description="Every command reachable through the vwx dispatcher")
+def resource_commands() -> str:
+    return cmd("list_commands")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Prompts — the standing workflows, as commands instead of prose
+# ═══════════════════════════════════════════════════════════════════
+# These recipes previously lived only in AGENTS.md, where an agent had to read
+# and reconstruct them. As prompts they surface as slash commands and cost
+# nothing until invoked.
+
+@mcp.prompt(description="Build a Baumkataster report worksheet from the tree objects in the open document")
+def baumkataster_report(layer: str = "") -> str:
+    scope = f"restricted to layer '{layer}'" if layer else "across all design layers"
+    return (
+        f"Build a Baumkataster report worksheet {scope} in the open Vectorworks "
+        "document.\n\n"
+        "1. `get_document_info` first — confirm the right file is open, and note "
+        "the units.\n"
+        "2. Find the tree objects with a criteria string rather than a per-object "
+        "walk. `criteria_count` first to see how many you are dealing with.\n"
+        "3. `create_report_worksheet` builds the worksheet, its DATABASE row, the "
+        "formulas and the placement in a single call — do not assemble it cell by "
+        "cell.\n"
+        "4. Report the row count back, and the worksheet name, so the user can "
+        "find it on the sheet layer.\n\n"
+        "Never run a full-document ForEachObject on a large file — it has frozen "
+        "Vectorworks for fifteen minutes. Walk per layer."
+    )
+
+
+@mcp.prompt(description="Classify landscape objects into DIN 276 KG 500 cost groups and write IFC property sets")
+def din276_classify(cost_group: str = "") -> str:
+    target = f"Target cost group: {cost_group}." if cost_group else ""
+    return (
+        f"Classify the objects in the open document into DIN 276 KG 500 cost "
+        f"groups and write the result as IFC property sets. {target}\n\n"
+        "1. Select the objects by criteria, not by hand — `select_by_criteria` "
+        "with a class or object-type filter.\n"
+        "2. `ifc_bulk_set_pset` writes the cost group across the whole selection "
+        "and attaches the pset where it is missing, with retry. Use it instead of "
+        "per-object property calls.\n"
+        "3. Verify with `criteria_count` that the number of classified objects "
+        "matches what you selected, and report any shortfall rather than "
+        "assuming success.\n\n"
+        "Object-level classification is known to work; MATERIAL classification is "
+        "not scriptable and has to be done once in the template by hand. Say so "
+        "explicitly if the user's goal needs it."
+    )
+
+
+@mcp.prompt(description="Export the current document to a format, with the pre-flight checks that usually get skipped")
+def export_document(fmt: str = "pdf") -> str:
+    return (
+        f"Export the open Vectorworks document to {fmt}.\n\n"
+        "Before exporting: `get_document_info` to confirm the file, and check "
+        "that the intended sheet layer or viewport is the active one — exporting "
+        "the wrong layer is the usual failure and it is silent.\n"
+        "An export can run for minutes. It reports progress and will be moved to "
+        "a background task automatically if it runs long; do not treat a slow "
+        "export as a hang, and do not start a second one.\n"
+        "Confirm the written path back to the user once it returns."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Toolset switching at runtime
+# ═══════════════════════════════════════════════════════════════════
+
+@vtool
+def set_toolset(ctx: Context, preset: str) -> str:
+    """Reshape the visible toolset in place: full | gis | modeling | baumkataster | minimal.
+
+    Previously this needed the VWX_TOOLSET environment variable and a server
+    restart. Switching emits tools/list_changed, so the client picks up the new
+    surface without reconnecting. 'full' restores everything."""
+    from tool_tags import preset_tags, PRESETS
+    if preset not in PRESETS:
+        return json.dumps({"error": f"unknown preset '{preset}'",
+                           "available": sorted(PRESETS)}, ensure_ascii=False)
+    # 'full' means every tag, not "no argument": a bare mcp.enable() does not
+    # clear a previously applied only=True filter, so switching to full that
+    # way silently left the narrower toolset in place.
+    tags = preset_tags(preset) or set(TOOL_TAGS.values())
+    mcp.enable(tags=tags, only=True)
+    count = len([n for n, t in TOOL_TAGS.items() if t in tags])
+    return json.dumps({"status": "ok", "preset": preset, "tools": count,
+                       "tags": sorted(tags)}, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Middleware
+# ═══════════════════════════════════════════════════════════════════
+
+from fastmcp.server.middleware import Middleware
+
+
+class ProgressHeartbeatMiddleware(Middleware):
+    """Emit a progress notification while a tool call is still outstanding.
+
+    Two problems this solves. An MCP client aborts a call that sends neither a
+    response nor a progress notification for its idle window — five minutes for
+    an HTTP server — so any Vectorworks operation that legitimately runs longer
+    than that used to die even though VW was working correctly. And a call that
+    the client has moved to a background task is otherwise indistinguishable
+    from a hung one.
+
+    The tool bodies are synchronous (they block in fastmcp's threadpool on the
+    file or socket transport), so they cannot await anything themselves. Doing
+    the heartbeat here in async middleware keeps all 248 of them unchanged.
+    """
+
+    def __init__(self, interval: float = 20.0):
+        self.interval = interval
+
+    async def on_call_tool(self, context, call_next):
+        ctx = getattr(context, "fastmcp_context", None)
+        if ctx is None or self.interval <= 0:
+            return await call_next(context)
+
+        task = asyncio.ensure_future(call_next(context))
+        waited = 0.0
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=self.interval)
+            if done:
+                break
+            waited += self.interval
+            try:
+                # No total: the VW side cannot report percent-complete, and a
+                # made-up denominator would render as a lying progress bar.
+                await ctx.report_progress(progress=waited)
+            except Exception:
+                # A client that does not accept progress notifications must not
+                # take the tool call down with it.
+                pass
+        return await task
+
+
+# Read-only tools whose answers are stable for the life of a short cache
+# window. Strictly an allowlist: fastmcp's call-tool cache is keyed on name +
+# arguments and knows nothing about document mutation, so anything that could
+# be invalidated by a drawing edit stays out. Document identity, unit system,
+# the command catalogue and the vs.* signature index do not change while the
+# document is open; layer and class lists do, which is why they are absent
+# despite being read-only.
+#
+# v14: everything document-specific is OUT. The cache key is tool name +
+# arguments — it knows neither the session nor the target document, so with
+# document routing (and before that, after any switch_document) it served one
+# document's info, units or georeference as the answer for another. Found live:
+# agent A's get_document_info returned agent B's document from the cache.
+_CACHEABLE = [
+    "list_commands",
+    "vs_signature",
+    "vs_index_stats",
+]
+
+
+def _install_middleware():
+    from fastmcp.server.middleware.timing import TimingMiddleware
+    mcp.add_middleware(TimingMiddleware())
+    if VWX_HEARTBEAT > 0:
+        mcp.add_middleware(ProgressHeartbeatMiddleware(VWX_HEARTBEAT))
+        logger.info(f"progress heartbeat every {VWX_HEARTBEAT:.0f}s")
+    if VWX_CACHE_TTL > 0:
+        try:
+            from fastmcp.server.middleware.caching import ResponseCachingMiddleware
+            mcp.add_middleware(ResponseCachingMiddleware(
+                call_tool_settings={
+                    "enabled": True,
+                    "ttl": VWX_CACHE_TTL,
+                    "included_tools": _CACHEABLE,
+                },
+                # tools/list is deliberately NOT cached. Caching it froze the
+                # catalogue: set_toolset would change the visible surface and
+                # every subsequent list would still serve the pre-switch tool
+                # set until the TTL expired. A stale catalogue is far worse
+                # than re-listing — and the client already caches it itself
+                # under tool-search deferral.
+                list_tools_settings={"enabled": False},
+                list_resources_settings={"enabled": False},
+                list_prompts_settings={"enabled": False},
+                read_resource_settings={"enabled": False},
+                get_prompt_settings={"enabled": False},
+            ))
+            logger.info(f"response cache on for {len(_CACHEABLE)} read-only "
+                        f"tools (ttl {VWX_CACHE_TTL}s)")
+        except Exception as e:
+            logger.warning(f"response caching unavailable: {e}")
+
+
+class _BearerTokenGuard:
+    """Optional shared-secret check on every HTTP request (pure ASGI).
+
+    Active only when VWX_MCP_TOKEN is set. Clients then send
+    'Authorization: Bearer <token>' (Claude Code: "headers" in .mcp.json).
+    The server listens on 127.0.0.1 only, so this guards against other local
+    processes and users — anything that can reach the port could otherwise
+    drive Vectorworks, including execute_script."""
+
+    def __init__(self, app, token):
+        self.app = app
+        self.expected = ("Bearer " + token).encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            auth = dict(scope.get("headers") or []).get(b"authorization", b"")
+            import hmac
+            if not hmac.compare_digest(auth, self.expected):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body",
+                            "body": b'{"error":"missing or wrong bearer token"}'})
+                return
+        await self.app(scope, receive, send)
+
+
 def main():
     _init_otel()
+    _install_middleware()
+    _export_readonly_manifest()
     # Optional toolset filtering via the fastmcp Visibility API.
     # VWX_TOOLSET=mechanical|gis|modeling|baumkataster|minimal|full.
     # Exact-name presets are checked first; broad presets continue to use tags.
@@ -3103,10 +4582,30 @@ def main():
 
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport in ("http", "streamable-http", "sse"):
+        host = os.environ.get("FASTMCP_HOST", "127.0.0.1")
+        port = int(os.environ.get("FASTMCP_PORT", "8082"))
+        extra = {}
+        # Host/Origin guard: a web page in any browser on this machine can send
+        # requests to 127.0.0.1:8082 — and via DNS rebinding even pass the
+        # same-origin rules. Strict mode accepts only local Host headers and
+        # rejects foreign browser Origins, which closes that door without
+        # affecting non-browser MCP clients. VWX_ORIGIN_GUARD=0 turns it off.
+        if os.environ.get("VWX_ORIGIN_GUARD", "1") != "0":
+            extra["host_origin_protection"] = True
+            extra["allowed_hosts"] = [f"127.0.0.1:{port}", f"localhost:{port}"]
+        token = os.environ.get("VWX_MCP_TOKEN", "").strip()
+        if token:
+            from starlette.middleware import Middleware as _ASGIMw
+            extra["middleware"] = [_ASGIMw(_BearerTokenGuard, token=token)]
+            logger.info("bearer token required on every request (VWX_MCP_TOKEN)")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(f"listening on {host} — Vectorworks becomes reachable from "
+                           "the network; set VWX_MCP_TOKEN")
         mcp.run(
             transport=transport,
-            host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
-            port=int(os.environ.get("FASTMCP_PORT", "8082")),
+            host=host,
+            port=port,
+            **extra,
             # uvicorn's default timeout_keep_alive is 5s: any two tool calls
             # spaced further apart raced the server's FIN on the idle keep-alive
             # connection -> sporadic "Unable to connect" on the first call,
@@ -3119,3 +4618,268 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein pset-import
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def ifc_pset_defined(ctx: Context, name: Optional[str] = None,
+                      names: Optional[List[str]] = None) -> str:
+    """Check whether one or more custom IFC Psets are defined in the document
+    (and whether each is 'custom'). Pass `name` for one pset or `names` for
+    several. Returns {results: {name: {defined, custom}}}."""
+    p: Dict[str, Any] = {}
+    if name: p["name"] = name
+    if names: p["names"] = names
+    return cmd("ifc_pset_defined", p)
+
+@vtool
+def ifc_import_pset_defs(ctx: Context, path: str, variante: int = 1,
+                          names: Optional[List[str]] = None) -> str:
+    """Import Custom Object Pset SCHEMA DEFINITIONS from a file/folder into the
+    document -- the office-CSV-to-shared-schema path. variante 1 =
+    IFC_DefPsetImport (expects a FOLDER per VW's own doc text); variante 2 =
+    IFC_DefPsetImport2 (expects a single FILE). Both underlying functions
+    return only a bare boolean and there is no vs.* call that lists all pset
+    schemas defined in the document, so pass `names` -- the pset names you
+    expect this file to define -- to get a real before/after
+    IFC_IsPsetDefined diff instead of trusting the raw return value alone.
+    NOTE: a schema imported this way lands in the document as a Record
+    Format, not as a database table -- do not expect worksheet/database
+    behavior from it."""
+    p: Dict[str, Any] = {"path": path, "variante": variante}
+    if names: p["names"] = names
+    return cmd("ifc_import_pset_defs", p)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein datenmanager
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def ifc_dm_list_objects(ctx: Context) -> str:
+    """List the IFC Data Mapping's object-rule names (cheap, no deep walk) — call before ifc_dm_dump on a large (~900+ object) mapping."""
+    return cmd("ifc_dm_list_objects", {})
+
+@vtool
+def ifc_dm_dump(ctx: Context, object_name: Optional[str] = None) -> str:
+    """Full IFC Data Mapping dump: Objects->Entries->Fields and Entries->PSets->PSet-Fields, with flags + conditions. Pass object_name to restrict to one object (recommended — the mapping can hold 900+ objects); each list in the result carries its own index_base (0/1/-1=ambiguous) since 0- vs 1-based indexing is unverified for this VW API family."""
+    p = {}
+    if object_name: p["object_name"] = object_name
+    return cmd("ifc_dm_dump", p)
+
+@vtool
+def ifc_dm_add_entry(ctx: Context, object_name: str, entry: str, enable: bool = True) -> str:
+    """Add a new entry to an object's IFC Data Mapping rule."""
+    return cmd("ifc_dm_add_entry", {"object_name": object_name, "entry": entry, "enable": enable})
+
+@vtool
+def ifc_dm_add_field(ctx: Context, object_name: str, entry: str, field: str, type: str = "IfcLabel",
+                     optional: bool = False, enable: bool = True, empty: bool = False) -> str:
+    """Add a direct field (outside any Pset) to an (object, entry) mapping rule."""
+    return cmd("ifc_dm_add_field", {"object_name": object_name, "entry": entry, "field": field,
+                                    "type": type, "optional": optional, "enable": enable,
+                                    "empty": empty})
+
+@vtool
+def ifc_dm_add_pset(ctx: Context, object_name: str, entry: str, pset: str, enable: bool = True,
+                    condition: str = "") -> str:
+    """Attach a Pset to an (object, entry) mapping rule. Uses IFC_DMAddPSetInEntry
+    (never IFC_DMAddPSetForEnt, which silently creates a duplicate entry)."""
+    return cmd("ifc_dm_add_pset", {"object_name": object_name, "entry": entry, "pset": pset,
+                                   "enable": enable, "condition": condition})
+
+@vtool
+def ifc_dm_add_pset_field(ctx: Context, object_name: str, entry: str, pset: str, field: str,
+                          type: str = "IfcLabel", optional: bool = False, enable: bool = True,
+                          empty: bool = False) -> str:
+    """Add a field to a Pset already attached under an (object, entry) rule."""
+    return cmd("ifc_dm_add_pset_field", {"object_name": object_name, "entry": entry, "pset": pset,
+                                         "field": field, "type": type, "optional": optional,
+                                         "enable": enable, "empty": empty})
+
+@vtool
+def ifc_dm_enable_object(ctx: Context, object_name: str, enable: bool = True) -> str:
+    """Enable/disable an IFC Data Mapping object rule as a whole."""
+    return cmd("ifc_dm_enable_object", {"object_name": object_name, "enable": enable})
+
+@vtool
+def ifc_dm_enable_entry(ctx: Context, object_name: str, entry: str, enable: bool = True) -> str:
+    """Enable/disable one entry under an IFC Data Mapping object."""
+    return cmd("ifc_dm_enable_entry", {"object_name": object_name, "entry": entry, "enable": enable})
+
+@vtool
+def ifc_dm_enable_pset(ctx: Context, object_name: str, entry: str, pset: str, enable: bool = True) -> str:
+    """Enable/disable a Pset under an (object, entry) IFC Data Mapping rule."""
+    return cmd("ifc_dm_enable_pset", {"object_name": object_name, "entry": entry, "pset": pset,
+                                      "enable": enable})
+
+@vtool
+def ifc_dm_set_entry_type(ctx: Context, object_name: str, entry: str, type: str) -> str:
+    """Set an entry's IfcEntry type (documented only as Primary/Secondary; exact literal spelling unverified)."""
+    return cmd("ifc_dm_set_entry_type", {"object_name": object_name, "entry": entry, "type": type})
+
+@vtool
+def ifc_dm_set_object_condition(ctx: Context, object_name: str, condition: str) -> str:
+    """Set the ObjCond formula that decides whether an IFC Data Mapping object rule applies."""
+    return cmd("ifc_dm_set_object_condition", {"object_name": object_name, "condition": condition})
+
+@vtool
+def ifc_dm_set_field_map(ctx: Context, object_name: str, entry: str, field: str, mapping: str,
+                         pset: Optional[str] = None) -> str:
+    """Set a field's mapping-source formula, e.g. ='DTM6'.'Cut Volume'. Pass pset to target a Pset field, omit for a direct entry field."""
+    p = {"object_name": object_name, "entry": entry, "field": field, "mapping": mapping}
+    if pset: p["pset"] = pset
+    return cmd("ifc_dm_set_field_map", p)
+
+@vtool
+def ifc_dm_set_field_flags(ctx: Context, object_name: str, entry: str, field: str,
+                           enabled: Optional[bool] = None, optional: Optional[bool] = None,
+                           empty: Optional[bool] = None, type: Optional[str] = None) -> str:
+    """Set state flags (enabled/optional/empty/type) on a direct entry field — only flags you pass are changed."""
+    p = {"object_name": object_name, "entry": entry, "field": field}
+    if enabled is not None: p["enabled"] = enabled
+    if optional is not None: p["optional"] = optional
+    if empty is not None: p["empty"] = empty
+    if type is not None: p["type"] = type
+    return cmd("ifc_dm_set_field_flags", p)
+
+@vtool
+def ifc_dm_set_pset_field_flags(ctx: Context, object_name: str, entry: str, pset: str, field: str,
+                                enabled: Optional[bool] = None, optional: Optional[bool] = None,
+                                empty: Optional[bool] = None, type: Optional[str] = None) -> str:
+    """Set state flags (enabled/optional/empty/type) on a Pset field — only flags you pass are changed."""
+    p = {"object_name": object_name, "entry": entry, "pset": pset, "field": field}
+    if enabled is not None: p["enabled"] = enabled
+    if optional is not None: p["optional"] = optional
+    if empty is not None: p["empty"] = empty
+    if type is not None: p["type"] = type
+    return cmd("ifc_dm_set_pset_field_flags", p)
+
+@vtool
+def ifc_dm_delete_entry(ctx: Context, object_name: str, entry: str) -> str:
+    """Delete an entry (and its fields/Psets) from an IFC Data Mapping object."""
+    return cmd("ifc_dm_delete_entry", {"object_name": object_name, "entry": entry})
+
+@vtool
+def ifc_dm_delete_field(ctx: Context, object_name: str, entry: str, field: str) -> str:
+    """Delete a direct entry field from the IFC Data Mapping."""
+    return cmd("ifc_dm_delete_field", {"object_name": object_name, "entry": entry, "field": field})
+
+@vtool
+def ifc_dm_delete_pset(ctx: Context, object_name: str, entry: str, pset: str) -> str:
+    """Remove a Pset (and its fields) from an (object, entry) IFC Data Mapping rule."""
+    return cmd("ifc_dm_delete_pset", {"object_name": object_name, "entry": entry, "pset": pset})
+
+@vtool
+def ifc_dm_delete_pset_field(ctx: Context, object_name: str, entry: str, pset: str, field: str) -> str:
+    """Delete one field from a Pset in the IFC Data Mapping."""
+    return cmd("ifc_dm_delete_pset_field", {"object_name": object_name, "entry": entry, "pset": pset,
+                                            "field": field})
+
+@vtool
+def ifc_dm_save(ctx: Context, path: str, object_name: Optional[str] = None, to_file: bool = True) -> str:
+    """Save the IFC Data Mapping (IFC_DMSaveSettings — param meanings are a documented guess, see tool docstring in commands.py; test on a throwaway file first)."""
+    p = {"path": path, "to_file": to_file}
+    if object_name: p["object_name"] = object_name
+    return cmd("ifc_dm_save", p)
+
+@vtool
+def ifc_dm_load(ctx: Context, path: str) -> str:
+    """Load an IFC Data Mapping (IFC_DMLoadSettings — likely REPLACES the current mapping wholesale; snapshot with ifc_dm_dump first)."""
+    return cmd("ifc_dm_load", {"path": path})
+
+@vtool
+def ifc_dm_reset_to_default(ctx: Context, confirm: str) -> str:
+    """DESTRUCTIVE: wipes the ENTIRE IFC Data Mapping to VW factory defaults, no undo. Requires confirm == 'RESET DATA MAPPING TO DEFAULTS'."""
+    return cmd("ifc_dm_reset_to_default", {"confirm": confirm})
+
+@vtool
+def ifc_dm_reset_to_cobie_default(ctx: Context, confirm: str) -> str:
+    """DESTRUCTIVE: wipes the ENTIRE IFC Data Mapping to VW's COBie defaults, no undo. Requires confirm == 'RESET DATA MAPPING TO COBIE DEFAULTS'."""
+    return cmd("ifc_dm_reset_to_cobie_default", {"confirm": confirm})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein klassenattribute
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def get_class_appearance(ctx: Context, name: str) -> str:
+    """Read one class's full appearance (fill/pen color, lineweight, fill
+    pattern, line style, opacity, hatch) to verify a set_class_appearance write."""
+    return cmd("get_class_appearance", {"name": name})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein schraffuren
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def create_hatch_definition(ctx: Context, name: str, layers: list,
+                            page_space: bool = False, rotate_in_wall: bool = False,
+                            color_index: int = 0, replace: bool = False) -> str:
+    """Create a new vector-fill hatch definition. layers: [{x_start,y_start,x_repeat,y_repeat,x_offset,y_offset,dash_factor,line_weight,color_index}, ...]. Fails if name exists unless replace=True."""
+    p = {"name": name, "layers": layers, "page_space": page_space,
+         "rotate_in_wall": rotate_in_wall, "color_index": color_index, "replace": replace}
+    return cmd("create_hatch_definition", p)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein hybridsymbole
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def get_symbol_type(ctx: Context, object_id: str = None, name: str = None, layer: str = None) -> str:
+    """Check if a symbol is 2D, 3D, or hybrid. Pass object_id (a placed instance, cheap and exact) OR name + layer
+    (searches one layer for the first placed instance). name WITHOUT layer is refused: vs.ForEachObject has no
+    early-abort, so a name-only search would walk the whole document just to find one instance."""
+    p = {}
+    if object_id: p["object_id"] = object_id
+    if name: p["name"] = name
+    if layer: p["layer"] = layer
+    return cmd("get_symbol_type", p)
+
+@vtool
+def get_symbol_options(ctx: Context, name: str) -> str:
+    """Read a symbol definition's default class + insert/break mode. Tuple order from VW is unverified — see 'warning' in the result."""
+    return cmd("get_symbol_options", {"name": name})
+
+@vtool
+def set_symbol_options(ctx: Context, name: str, insert_mode: int = 0, break_mode: int = 0, class_name: str = "") -> str:
+    """Set a symbol definition's default class, insert mode, and break mode (raw VW integer codes)."""
+    return cmd("set_symbol_options", {"name": name, "insert_mode": insert_mode,
+                                       "break_mode": break_mode, "class_name": class_name})
+
+@vtool
+def create_hybrid_symbol(ctx: Context, name: str, object_ids_2d: list = None, object_ids_3d: list = None,
+                          folder: str = None, class_name: str = None,
+                          insert_mode: int = None, break_mode: int = None) -> str:
+    """Create a symbol def from both 2D and 3D source objects. Experimental: whether VW classifies the result as truly hybrid is unverified — see 'warnings' in the result."""
+    p = {"name": name, "object_ids_2d": object_ids_2d or [], "object_ids_3d": object_ids_3d or []}
+    if folder: p["folder"] = folder
+    if class_name: p["class_name"] = class_name
+    if insert_mode is not None: p["insert_mode"] = insert_mode
+    if break_mode is not None: p["break_mode"] = break_mode
+    return cmd("create_hybrid_symbol", p)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein dokumentwechsel
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def confirm_active_document(ctx: Context, expected: str) -> str:
+    """Confirm the active document matches 'expected' after switch_document.
+
+    Call this as the command right after switch_document — the switch is
+    posted, not done, so switch_document's own answer never proves anything.
+    'expected' can be a bare file name (base-name match) or a full/partial
+    path including the folder, which is the only way to tell apart two open
+    files that share a name but live in different folders — when 'expected'
+    looks like a path, the path comparison alone decides (a bare-name match
+    cannot rule out the wrong folder, so it is not allowed to override it).
+    """
+    return cmd("confirm_active_document", {"expected": expected})

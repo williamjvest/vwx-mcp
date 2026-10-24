@@ -1,2 +1,28 @@
-# vwx-mcp server deps. Migrated to standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md).
-fastmcp==3.4.2
+# vwx-mcp server deps. Migrated to standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md),
+# then to 4.x once 4.0 went GA.
+#
+# 4.0.3 (2026-09): the 4.x line is final, so the "stay on 3.4.7 until GA" note
+# that used to live here is spent. What 4.0 changes and how it checked out on
+# this install:
+#   * MCP SDK v2 (mcp 2.1.1, mcp-types split out) — `from mcp.types import
+#     ToolAnnotations, TextContent` still resolves, now via mcp_types.
+#   * output-schema handling was the one real risk, since `output_schema=None`
+#     in vtool() is load-bearing: without it every tool emits an outputSchema
+#     derived from `-> str` and clients have historically dropped the whole
+#     tool set. Verified after the upgrade: tools/list = 252 tools, 0 with
+#     outputSchema, over both in-process and streamable HTTP on :8082.
+#   * the Docket tasks extra is now the separate `fastmcp-tasks` package, still
+#     reachable as `fastmcp[tasks]` and still pulling pydocket — so the
+#     `import docket` availability gate above VWX_TASKS stays correct.
+#   * unchanged and re-verified: mcp.tool(timeout=/tags=/annotations=/meta=),
+#     mcp.enable(tags=, only=True), the Middleware base and its
+#     context.fastmcp_context, TimingMiddleware, ResponseCachingMiddleware's
+#     *_settings kwargs, ToolResult + utilities.types.Image, and run()'s
+#     host/port/uvicorn_config transport kwargs.
+# Re-verify tools/list emits no outputSchema before moving this pin again.
+fastmcp==4.0.10
+
+# Window capture for the `screenshot` tool: PNG encoding and a quality
+# downscale. Vectorworks has no headless render-to-file API, so visual
+# verification is a Win32 window capture done server-side.
+pillow>=11.0

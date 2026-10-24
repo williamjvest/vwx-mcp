@@ -12,8 +12,8 @@ from tool_tags import PRESET_TOOLS, TOOL_TAGS, preset_names  # noqa: E402
 class ToolPresetTests(unittest.TestCase):
     def test_explicit_tool_count_matches_tags_and_docs(self):
         source = (ROOT / "mcp-server" / "vwx_mcp_server.py").read_text()
-        self.assertEqual(sum(line.strip() == "@vtool" for line in source.splitlines()), 291)
-        self.assertEqual(len(TOOL_TAGS), 291)
+        self.assertEqual(sum(line.strip() == "@vtool" for line in source.splitlines()), 334)
+        self.assertEqual(len(TOOL_TAGS), 334)
 
     def test_mechanical_preset_is_focused_and_complete(self):
         tools = PRESET_TOOLS["mechanical"]

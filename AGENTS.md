@@ -10,6 +10,33 @@ draws) rather than errors.
 MCP endpoint: `http://127.0.0.1:8082/mcp` (streamable-http). The VW-side bridge
 must be running first (see README). `ping` confirms the full chain is live.
 
+## Working next to other agents (v14) — read this first
+
+Several agents (and the user) can share one Vectorworks. The rules:
+
+1. **Bind, don't switch.** Call `use_document("MyFile.vwx")` once (or pass
+   `document=` on `vwx` / `vwx_batch` / `execute_script`). Every later call of
+   your session runs in that document; the bridge activates and verifies it,
+   and brings the user's document back afterwards. `switch_document` changes
+   the front document for everyone — avoid it when others may be working.
+2. **Unbound calls go to the user's document**, even while the bridge is
+   visiting another file for someone else.
+3. **Lock before multi-step builds:** `lock_document(doc, minutes, reason)` →
+   other sessions get `DOC_LOCKED` on writes (reads pass). `unlock_document`
+   when done.
+4. **Batch work yields:** `use_document(doc, priority="batch")` lets
+   interactive calls of other agents overtake your queue.
+5. **Open/close without clicking:** `open_document(local_path)` (never from
+   `Y:` — copy first), `close_document(doc, save=True)`.
+6. **See who does what:** `get_bridge_status` (queue, bindings, locks, routing,
+   audit tail).
+7. `screenshot` always shows the FRONT document — with bindings that is not
+   necessarily yours; check `get_bridge_status` → `routing`.
+
+Error codes: `DOC_NOT_OPEN`, `DOC_AMBIGUOUS`, `DOC_SWITCH_FAILED`,
+`DOC_LOCKED`, `DOC_UNSAVED`, `DOC_CLOSE_NEEDS_FORCE`, `DOC_OPEN_TIMEOUT`,
+`PATH_DENIED` — none of them ran anything.
+
 ## Three access layers — pick the narrowest that works
 
 1. **Explicit tools** (291). Typed, documented, safe. Prefer these.
@@ -42,12 +69,52 @@ If the client is loading too many tools, set `VWX_TOOLSET` (env, in the launcher
 | `draw_circle` returns `object_id: null`, nothing drawn | `vs.ArcByCenter((cx,cy), r, 0, 360)` is broken on VW2026 | `vs.Oval(cx-r, cy+r, cx+r, cy-r)` (bbox: left, top, right, bottom), then `vs.LNewObj()` |
 | Arc has wrong angular extent | `vs.Arc`'s 6th arg is the **sweep** (included) angle, **not** the end angle | `vs.Arc(l, t, r, b, start, sweep)` — pass sweep directly (verified: `GetArc` of `Arc(…,30,90)` → `(30, 90)`) |
 | `vs.GetVWVersion` → AttributeError | does not exist on VW2026 | `vs.GetVersion()` → `(major, minor, maint, build)` |
-| Can't enumerate class names | `GetClassName` / `GetClName` / `ClassList` removed | walk objects with `ForEachObject` and collect `vs.GetClass(h)` |
+| Can't enumerate class names | `GetClassName` / `GetClName` removed | `vs.ClassNum()` + `vs.ClassList(i)` (1-based) works on VW2026 |
+| `vs.GetObject(name)` says a name exists that doesn't | returns a dummy handle of **type 0** for unknown names | treat as missing unless `vs.GetTypeN(h) != 0` (helper `_name_obj`) |
+| A plug-in object "contains" hundreds of layer objects | `vs.FInGroup()` of an **empty** group returns a handle into the **parent list** (layer), so `ForEachObjectInList` walks the whole layer | count a child only if `GetObjectUuid(GetParent(child)) == container UUID` (see `_deep_count`) |
+| `while h: h = vs.NextObj(h)` hangs VW | handle-walk loops can spin forever on VW2026 | `ForEachObject` with a criteria string, or `BuildResourceList` for resources |
+| Drop shadow offset/blur 1000× too big after copying | `SetDropShadowData` stores offset/blur 1000× relative to `GetDropShadowData` | pass `offset/1000`, `blur/1000`, verify by read-back |
+| Text position from `GetBBox` is metres off | `GetBBox` of rotated text is a screen box | `vs.HCenter(h)` / `vs.GetTextOrientation(h)` |
 | `LNewObj()` returns the wrong/no object after a geometry op | some ops convert/replace (e.g. `DTM6_SendToSurface` converts 2D→3D and does **not** surface via `LNewObj`) | name the object first (`SetName`) + look it up, or use `PrevObj(LNewObj())` |
 | `ForEachObject` callback corrupts iteration | mutating (delete/create/reclass/restack) during traversal invalidates `NextObj` | collect handles first, mutate after |
 | `SetFillFore`/`SetPenFore` silently no-op | passing positional r,g,b | pass a single `RGBCOLOR` tuple |
 | Old marker/pen/dash/wall-height calls misbehave | pre-2019 forms are obsolete | use the `…N` variants (`SetLSN`, `InsertNewComponentN`, …) |
 | Criteria string matches nothing | quoting | single-quote record names, mind the parens: `"((R in ['Part Info']))"` |
+
+## Resources (Zubehör) and plug-in styles — what a script can and cannot do
+
+Verified live on VW2026 (Sept 2026). Commands: `resource_list`, `resource_info`,
+`resource_import`, `resource_duplicate`, `plant_style_relink`, `pio_nesting_check`,
+`datatag_refresh_all` (plus the older `resource_tree/move/rename/delete/create_folder`).
+
+| Task | Works by script? | How |
+|---|---|---|
+| List resources of any type | yes | `BuildResourceList(type, 0, '')` / `BuildResourceListN(type, path)`; types 16 symbol/style, 18 worksheet, 19 material, 47 record, 66 hatch, 92 folder, 96 line type, 97 texture, 109 text style, 120 gradient |
+| Duplicate a symbol or plug-in style (plant, data tag, …) | yes, via import | rename existing → import original from the **saved** file (`ImportResToCurFileN`) → rename import → rename back (`resource_duplicate`). Copies hidden style data and generated geometry (e.g. Maxon plant meshes). Unsaved edits are not included — save first |
+| `CreateDuplicateObject(symbolDefinition, None)` | no | returns an invalid handle |
+| Create a plug-in style from scratch | no | `BeginSym` + copied inner PIO + `SetSymDefSubType` yields a style **without** hidden data (data tags render no text). Create styles in the UI |
+| Edit a data tag layout / field definition (`#Record#.#Field#`) | no | UI only; afterwards call `datatag_refresh_all` or new tags keep the placeholder |
+| Link Plant objects to a plant style | yes | Plant fields `PlantDescription`, `Plant Name Formula` (`"<style>"`), `isCustom=False`, `ResetObject`; after editing the style's inner plant, reset instances **twice** (first regen still shows the old hidden symbol size) |
+| Edit a plant style's size | yes | set the inner plant's `spread`/`height` (+ spacing fields) and `ResetObject` it; instances then draw at that size (2D and 3D) |
+| Attach a Maxon/Laubwerk 3D plant | partly | the `lw_*` fields can be copied, but the proxy **mesh** is only generated by the UI. Set it once in one style, then `resource_duplicate` that style for other sizes and change spread/height — the mesh scales with the instance |
+| Import: identical resource already present | skipped | documented behaviour: exact match is no conflict, callback not called, existing handle returned |
+| Names | global | resources share one namespace with layers and objects (a layer named X blocks a style named X) |
+
+## Terrain: grades, stakes, hardscape surface modifiers (verified 2026-10-10)
+
+| Task | Command | Notes |
+|---|---|---|
+| Grade (Gefälle-Grundriss) on a layer | `create_grade` → `grade_finish` (separate call) | Needs ONE tool-placed Grade CW on the target layer (or `template`): a Grade made by `CreateCustomObjectPath` stays uninitialised (stub arrow at −10/−10, length 0). The template's height Data Tags only appear after the script ends — `grade_finish` moves the end tag and drops duplicates at network nodes |
+| 3D polygon → grades | `convert_3dpoly_to_grades` (+ `hardscape` to put them into a hardscape) | one grade per edge; `GetPolyPt3D` is 0-based |
+| Stake (Höhenpunkt) | `create_stake` | elevation = the object's 3D position; a reset rewrites `Z Value` from it |
+| Grade INSIDE an aligned hardscape (shapes the surface without a site model) | `hardscape_prepare_modifiers` → `python tools/belag_modifikatoren_oeffnen.py` (once per hardscape, then `--verlassen`) → `hardscape_add_grade` | The modifier group exists only after the UI command "Oberflächenmodifikatoren bearbeiten" was entered once; groups built by script are discarded on reset. Aligned = `Config=Aligned` + `Mode 3D=7` + `Site Model Interaction=ActAsBoth` (`Mode 3D` alone leaves the menu item missing) |
+| Read a hardscape surface | `hardscape_sample_z`, `hardscape_modifier_info` | `GetZatXY` on a hardscape returns 0 almost everywhere — the sampler triangulates a `MeshToGroup` copy instead |
+
+Coordinate rules (all checked against the georeferenced Lageplan, origin −2047217/−6626760, hardscape rotated −13.9°):
+- PIO paths are stored RAW: `raw = local − GetOrigin()`. A path written with `AddPoint(0,0)` starts at `+origin`, kilometres off in a georeferenced file. `_grade_shape` subtracts the origin.
+- Inside a hardscape, modifiers live in its local raw frame: `v = R(−rz)·(world − offset) − GetOrigin()`; mesh and path use the same frame.
+- Heights are absolute; the surface = grade height + the grade object's z → keep inner grades at z = 0.
+- Changing the user origin afterwards does not disturb existing inner modifiers (re-sampled after `SetOrigin`).
 
 ## VW2026 API renames (function does not exist under the old name)
 
@@ -253,7 +320,11 @@ Set in `bridge/vwx-mcp.bat`.
 | `VWX_TASKS` | _(off)_ | Opt long-running tools into the MCP Tasks extension. Needs `pip install 'fastmcp[tasks]'` **and** a Tasks-capable client; warns + stays off otherwise |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | If set, exports fastmcp's spans via OTLP. Needs `opentelemetry-exporter-otlp` |
 | `MCP_TRANSPORT` | `stdio` | `streamable-http` for the HTTP server, `stdio` for local |
-| `FASTMCP_HOST` / `FASTMCP_PORT` | `0.0.0.0` / `8082` | HTTP bind |
+| `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8082` | HTTP bind (a non-local bind logs a warning — set a token) |
+| `VWX_MCP_TOKEN` | _(off)_ | Shared secret; clients must send `Authorization: Bearer <token>` |
+| `VWX_ORIGIN_GUARD` | `1` | Strict Host/Origin check against browser pages / DNS rebinding |
+| `VWX_DENY_ROOTS` | `Y:\;\\` | `;`-separated roots that exports, saves and `open_document` refuse |
+| `VWX_DRAIN_BUDGET_S` | `2.0` | (VW process env) max seconds per drain before the UI gets a turn |
 | `DESKTOP_HOST` / `VWX_MCP_PORT` | `127.0.0.1` / `9878` | VW bridge socket |
 
 ## Reliability & observability notes

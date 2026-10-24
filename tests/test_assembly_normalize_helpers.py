@@ -35,27 +35,36 @@ class AssemblyNormalizeHelperTests(unittest.TestCase):
         )
         self.assertEqual(classify(86, "FRAME-01", "None", dims, center), "model")
 
-    def test_named_view_uses_verified_six_argument_setview_signature(self):
+    def test_named_view_uses_SetViewVector(self):
+        # VW2027: set_3d_view uses SetViewVector(loc, target, up), not SetView.
         calls = []
         original_vs = self.commands.vs
-        self.commands.vs = types.SimpleNamespace(SetView=lambda *args: calls.append(args))
+        self.commands.vs = types.SimpleNamespace(
+            SetViewVector=lambda loc, tgt, up: calls.append((loc, tgt, up)))
         try:
             result = self.commands.set_3d_view({"view": "right"})
         finally:
             self.commands.vs = original_vs
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(calls, [(0.0, 90.0, 0.0, 0.0, 0.0, 0.0)])
+        self.assertEqual(len(calls), 1)
+        loc, tgt, up = calls[0]
+        self.assertEqual(loc, (1, 0, 0))   # right = camera at +X
+        self.assertEqual(tgt, (0, 0, 0))
+        self.assertEqual(up, (0, 0, 1))
 
-    def test_named_view_rejects_unknown_value_without_calling_vectorworks(self):
+    def test_named_view_falls_back_to_top_on_unknown_value(self):
+        # Unknown views default to 'top' (no error — upstream behavior).
         calls = []
         original_vs = self.commands.vs
-        self.commands.vs = types.SimpleNamespace(SetView=lambda *args: calls.append(args))
+        self.commands.vs = types.SimpleNamespace(
+            SetViewVector=lambda loc, tgt, up: calls.append((loc, tgt, up)))
         try:
             result = self.commands.set_3d_view({"view": "diagonalish"})
         finally:
             self.commands.vs = original_vs
-        self.assertIn("error", result)
-        self.assertEqual(calls, [])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], (0, 0, 1))  # defaulted to top
 
     def test_projection_fails_closed_without_calling_vectorworks(self):
         calls = []

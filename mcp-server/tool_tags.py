@@ -33,6 +33,14 @@ TOOL_TAGS = {
     "qa_autopilot": "document",
     "save_document": "document",
     "save_document_as": "document",
+    "list_documents": "document",
+    "switch_document": "document",
+    "use_document": "document",
+    "lock_document": "document",
+    "unlock_document": "document",
+    "get_bridge_status": "document",
+    "open_document": "document",
+    "close_document": "document",
     "get_document_preferences": "document",
     "set_document_preferences": "document",
     # layers
@@ -217,6 +225,12 @@ TOOL_TAGS = {
     "vwx_batch": "escape",
     "list_commands": "escape",
     "vs_signature": "escape",
+    "set_toolset": "escape",
+    # Visual verification belongs to every workflow — a planting plan, a GIS
+    # sheet and a solid model all need someone to look at the result.
+    "screenshot": "escape",
+    "vw_dialog": "escape",
+    "vw_dialog_press": "escape",
     "vs_index_stats": "escape",
     "create_roof": "bim",
     "create_slab": "bim",
@@ -317,6 +331,39 @@ TOOL_TAGS = {
     "polygon_area_at_point": "query",
     "set_object_variable": "escape",
     "get_object_variable": "escape",
+
+    # nachgetragen beim Bausteine-Einbau
+    "confirm_active_document": "document",
+    "create_hatch_definition": "appearance",
+    "create_hybrid_symbol": "symbols",
+    "get_class_appearance": "classes",
+    "get_symbol_options": "symbols",
+    "get_symbol_type": "symbols",
+    "ifc_dm_add_entry": "bim",
+    "ifc_dm_add_field": "bim",
+    "ifc_dm_add_pset": "bim",
+    "ifc_dm_add_pset_field": "bim",
+    "ifc_dm_delete_entry": "bim",
+    "ifc_dm_delete_field": "bim",
+    "ifc_dm_delete_pset": "bim",
+    "ifc_dm_delete_pset_field": "bim",
+    "ifc_dm_dump": "bim",
+    "ifc_dm_enable_entry": "bim",
+    "ifc_dm_enable_object": "bim",
+    "ifc_dm_enable_pset": "bim",
+    "ifc_dm_list_objects": "bim",
+    "ifc_dm_load": "bim",
+    "ifc_dm_reset_to_cobie_default": "bim",
+    "ifc_dm_reset_to_default": "bim",
+    "ifc_dm_save": "bim",
+    "ifc_dm_set_entry_type": "bim",
+    "ifc_dm_set_field_flags": "bim",
+    "ifc_dm_set_field_map": "bim",
+    "ifc_dm_set_object_condition": "bim",
+    "ifc_dm_set_pset_field_flags": "bim",
+    "ifc_import_pset_defs": "bim",
+    "ifc_pset_defined": "bim",
+    "set_symbol_options": "symbols",
 }
 
 # Workflow presets usually select whole tags. Exact-name presets use explicit
@@ -326,8 +373,13 @@ PRESETS = {
     "full": None,  # sentinel: enable everything
     "gis": {"query", "layers", "classes", "appearance", "io", "geo",
             "records", "document", "escape"},
+    # 'escape' carries the three access layers themselves — vwx, vwx_batch,
+    # list_commands, vs_signature, execute_script, set_toolset. A preset that
+    # drops it strands the agent with only the explicit verbs and no way back,
+    # including no way to call set_toolset to undo the filter. It must be in
+    # every preset.
     "modeling": {"draw2d", "draw3d", "manipulate", "bim", "symbols",
-                 "appearance", "query", "document", "view"},
+                 "appearance", "query", "document", "view", "escape"},
     "baumkataster": {"landscape", "records", "query", "layers", "document",
                      "io", "escape"},
     "minimal": {"document", "query", "escape"},

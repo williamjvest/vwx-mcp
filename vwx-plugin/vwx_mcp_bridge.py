@@ -27,18 +27,41 @@ BRIDGE_VERSION = '3.0'
 try:
     _DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
-    _base = os.path.join(os.environ.get('APPDATA', ''),
-                         'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
-    if not os.environ.get('APPDATA'):  # macOS/Linux: no APPDATA, use Application Support
-        _base = os.path.expanduser(
-            '~/Library/Application Support/Vectorworks/2026/Plug-ins')
-    for _name in ('VWX-MCP', 'VW-MCP'):
-        _cand = os.path.join(_base, _name)
-        if os.path.isdir(_cand):
-            _DIR = _cand
+    # Newest installed Vectorworks that actually has the plug-in, not a
+    # hardcoded year. VWX_VW_VERSION forces one, matching every other
+    # component. macOS: no APPDATA, use ~/Library/Application Support.
+    _forced = os.environ.get('VWX_VW_VERSION')
+    _appdata = os.environ.get('APPDATA', '')
+    _roots_to_try = []
+    if _appdata:
+        _roots_to_try.append(os.path.join(_appdata, 'Nemetschek', 'Vectorworks'))
+    if not _appdata or os.sys.platform == 'darwin':
+        _roots_to_try.append(os.path.expanduser(
+            '~/Library/Application Support/Vectorworks'))
+    _DIR = None
+    for _root in _roots_to_try:
+        if _forced:
+            _versions = [_forced]
+        else:
+            try:
+                _versions = sorted((d for d in os.listdir(_root)
+                                    if len(d) == 4 and d.isdigit()), reverse=True)
+            except Exception:
+                _versions = []
+        for _version in _versions:
+            for _name in ('VWX-MCP', 'VW-MCP'):
+                _cand = os.path.join(_root, _version, 'Plug-ins', _name)
+                if os.path.isdir(_cand):
+                    _DIR = _cand
+                    break
+            if _DIR:
+                break
+        if _DIR:
             break
-    else:
-        _DIR = os.path.join(_base, 'VWX-MCP')
+    if _DIR is None:
+        _newest = _versions[0] if _versions else ''
+        _DIR = os.path.join(_roots_to_try[0] if _roots_to_try else '',
+                            _newest, 'Plug-ins', 'VWX-MCP')
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 

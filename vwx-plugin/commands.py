@@ -17,15 +17,24 @@ Key API facts:
   FInLayer: vs.FInLayer(layerH)
   ForEachObject: build list in callback — never create/delete/re-layer inside
 """
-import vs, traceback, os, json, time, uuid, math, hashlib
+import vs, traceback, os, json, re, time, uuid, math, hashlib
 import assembly_templates as _assembly_templates
 
 # ── vs.* signature index (knowledge index) ───────────────────────────────────
 # vs_index.json (built by tools/build_vs_index.py from the SDK vs.py stub) maps
 # every vs function -> {args, arity, required, ret, cat, doc}. Loaded once.
-# `vsig(name)` gives an agent/self an instant accurate signature; `vcheck` lets
-# call sites validate arity and fail with a clean dict instead of triggering a
-# VW engine error dialog.
+# NOTE: this used to also define vsig(name)/vcheck(name, argc) as an arity
+# pre-check for vs.* call sites. Repo-wide grep found zero call sites using
+# either — AGENTS.md advertised them as a safety net ("call sites can validate
+# arity ... instead of triggering a VW engine error dialog") that no code ever
+# actually used. Per this round's rule (a tool that fails silently is worse
+# than one that fails honestly), a documented safety net nobody calls is worse
+# than none — it tells a reader arity is checked when it is not. Removed
+# rather than retrofitted: wiring vcheck into the ~300 existing vs.* call
+# sites in this file is a large, high-risk rewrite out of scope for this pass
+# and not something to do without the bridge available to test against; see
+# AGENTS.md for the doc update that goes with this removal. _VS_INDEX itself
+# stays loaded — other code in this file may still want the raw index later.
 _VS_INDEX = {}
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vs_index.json'),
@@ -53,6 +62,7 @@ def vcheck(name, argc):
         return True
     return s['required'] <= argc <= s['arity']
 
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _c8(v):
@@ -76,16 +86,49 @@ def _h(oid):
     except Exception: pass
     return None
 
+
+# Opt-in diagnostic for _safe()'s swallowed exceptions. Off by default so the
+# ~241 existing call sites keep their current silent-fallback behavior with
+# zero output-format or timing change; set VWX_SAFE_DEBUG=1 in the process
+# environment before starting the bridge to print what _safe() is catching
+# (to stderr, via the traceback module already imported at module load) while
+# diagnosing a specific report of "empty/None field that should have a
+# value". Not wired to a file/log sink on purpose — this file runs inside
+# VW's process and must not assume a writable log path exists.
+_SAFE_DEBUG = bool(os.environ.get('VWX_SAFE_DEBUG'))
+
 def _safe(fn, default=None):
-    try: return fn()
-    except: return default
+    """Run fn(), returning default on failure instead of raising.
+    Catches Exception only — NOT BaseException. A bare `except:` (the
+    previous form here) also caught KeyboardInterrupt, SystemExit and
+    GeneratorExit, meaning Ctrl+C during a long _safe() call, or the
+    interpreter shutting down mid-call, was silently absorbed and turned
+    into a normal-looking `default` return instead of stopping anything.
+    `except Exception:` still catches every real failure mode _safe() exists
+    for (AttributeError from a vs.* name that does not exist on this VW
+    build, TypeError from a wrong arg count, NameError from a typo in the
+    caller's lambda, etc. — all Exception subclasses) so all ~241 existing
+    call sites keep behaving exactly as before for every case that used to
+    reach `return default`. Only the BaseException-but-not-Exception cases
+    change, and for those the old behavior was itself the bug."""
+    try:
+        return fn()
+    except Exception:
+        if _SAFE_DEBUG:
+            traceback.print_exc()
+        return default
 
 def _bbox(h):
+    """Return h's bounding box as a dict, or None if h has none / GetBBox
+    fails. Same except-Exception-not-bare-except fix as _safe() above, for
+    the same reason: this must not be able to swallow KeyboardInterrupt or
+    SystemExit."""
     try:
         p1, p2 = vs.GetBBox(h)
         return {'x1': p1[0], 'y1': p1[1], 'x2': p2[0], 'y2': p2[1],
                 'w': abs(p2[0]-p1[0]), 'h': abs(p2[1]-p1[1])}
-    except: return None
+    except Exception:
+        return None
 
 OBJ_TYPES = {
     2:'line',3:'rect',4:'oval',5:'polyline',6:'bezier',8:'arc',
@@ -224,31 +267,407 @@ def get_document_preferences(p):
     return out
 
 def set_document_preferences(p):
-    # Use VW's standard unit presets rather than low-level SetUnits flags.
-    # The MCP surface promises mm/cm/m/inch/feet; older bridge code silently
-    # ignored the units argument, which left mechanical files in inches.
-    unit_index = None
-    requested_units = p.get('units')
-    if requested_units:
-        key = str(requested_units).strip().lower()
-        unit_index = {
-            'mm': 7, 'millimeter': 7, 'millimeters': 7,
-            'cm': 8, 'centimeter': 8, 'centimeters': 8,
-            'm': 9, 'meter': 9, 'meters': 9,
-            'inch': 2, 'inches': 2, 'in': 2,
-            'feet': 3, 'foot': 3, 'ft': 3,
-        }.get(key)
-        if unit_index is None:
-            return {'error': 'unsupported units: %s (use mm/cm/m/inch/feet)'
-                    % requested_units}
-    if unit_index is not None:
-        vs.Units(unit_index)
-    # Drawing scale lives on the active design layer.
+    """Set document preferences. params: {units, scale}.
+
+    scale applies to the ACTIVE LAYER — in VW the scale lives on the layer,
+    not the document.
+
+    units is NOT settable from here. vs.SetUnits(fraction, display, format,
+    upi, name, squareName) takes six low-level values, not a name like "mm":
+    upi is units-per-inch (25.4 for mm, 2.54 for cm, 0.0254 for m) and the
+    remaining four control display and rounding. Guessing the other five from
+    a unit name would quietly change how every dimension in the document is
+    displayed. The server used to accept units= and pass it here, where
+    nothing read it and the command still answered ok — so a caller setting
+    units got a success for something that never happened. Now it says so.
+    """
+    out = {'status': 'ok'}
     if p.get('scale') is not None:
         h = vs.ActLayer()
-        if h: vs.SetLScale(h, float(p['scale']))
-    return {'status': 'ok', 'units': requested_units,
-            'scale': p.get('scale')}
+        if h:
+            _safe(lambda: vs.SetLScale(h, float(p['scale'])))
+            out['scale_set_on_layer'] = _safe(lambda: vs.GetLName(h))
+        else:
+            out['warning'] = 'no active layer — scale not applied'
+    if p.get('units') is not None:
+        out['units_ignored'] = (
+            'units cannot be set through this command: vs.SetUnits needs six '
+            'low-level values (fraction, display, format, units-per-inch, name, '
+            'squareName) and inferring five of them from a unit name would '
+            'silently change display and rounding for the whole document. '
+            'Use get_document_units to read the current setting.')
+    return out
+
+
+# ── Open documents ──────────────────────────────────────────────────────────
+# VectorScript cannot see past the active document. There is no
+# GetDocumentCount, no NextDocument, no SetActiveDocument — GetFName tells you
+# which file you are in and nothing about the others. Confirmed against the
+# 3098-function index, not assumed.
+#
+# What does know is Windows: every open document is a window in this very
+# process, and this code runs inside it. So the list comes from the window
+# manager and the switch is a posted MDI message.
+#
+# Posted, not sent. We are on VW's main thread; a SendMessage would re-enter
+# VW's UI while a script is still running. PostMessage queues the switch and
+# it happens after we return — which is why switch_document reports what it
+# asked for, never what happened. The next command runs in the new document
+# and can confirm it. A tool that claimed success here would be guessing.
+
+def _win32():
+    """user32 + this process id, or None where there is no Windows API.
+
+    Also pins argtypes/restype on every user32 function this module calls
+    that carries a window HANDLE (as argument or return value). Without this,
+    ctypes falls back to treating an untyped return as a 32-bit signed int —
+    which happens to work while handle values stay small, and can silently
+    misbehave later (e.g. the GetParent(h) == client membership test in
+    _dokumentfenster) once a handle's value exceeds that range. Cheap to set
+    on every call; ctypes caches the function object per name on the DLL, so
+    this is idempotent.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        u.GetParent.argtypes = [wintypes.HWND]
+        u.GetParent.restype = wintypes.HWND
+        u.GetTopWindow.argtypes = [wintypes.HWND]
+        u.GetTopWindow.restype = wintypes.HWND
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u.PostMessageW.restype = wintypes.BOOL
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.SetForegroundWindow.restype = wintypes.BOOL
+        u.IsIconic.argtypes = [wintypes.HWND]
+        u.IsIconic.restype = wintypes.BOOL
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.ShowWindow.restype = wintypes.BOOL
+        return u, ctypes.windll.kernel32.GetCurrentProcessId(), ctypes, wintypes
+    except Exception:
+        return None
+
+
+def _fenster_titel(u, ctypes, h):
+    n = u.GetWindowTextLengthW(h)
+    b = ctypes.create_unicode_buffer(n + 2)
+    u.GetWindowTextW(h, b, n + 2)
+    return b.value or ''
+
+
+def _fenster_klasse(u, ctypes, h):
+    b = ctypes.create_unicode_buffer(256)
+    u.GetClassNameW(h, b, 256)
+    return b.value or ''
+
+
+def _dokumentfenster():
+    """Every VW document window in this process.
+
+    Returns (liste, mdi_client, diagnose). Each entry carries hwnd, title and
+    the file name teased out of it; mdi_client is the MDI container when VW
+    uses one, so the caller knows which message to post. diagnose also
+    carries 'aktiv_hwnd' — the MDI child currently on top of the Z-order,
+    which MDICLIENT always keeps for whichever child is active. That is a
+    plain, read-only Z-order query (GetTopWindow), not a message post — it
+    changes nothing and is safe to call while the script is still running,
+    unlike WM_MDIACTIVATE.
+    """
+    teile = _win32()
+    if not teile:
+        return [], None, {'grund': 'kein Windows-API (ctypes fehlt)'}
+    u, pid, ctypes, wintypes = teile
+
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    oberste, mdi_clients, kinder = [], [], []
+
+    def _oben(h, _l):
+        p = wintypes.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid:
+            oberste.append(h)
+        return True
+    u.EnumWindows(EnumProc(_oben), 0)
+
+    def _kind(h, _l):
+        kl = _fenster_klasse(u, ctypes, h)
+        if kl == 'MDIClient':
+            mdi_clients.append(h)
+        kinder.append((h, kl))
+        return True
+    for h in oberste:
+        u.EnumChildWindows(h, EnumProc(_kind), 0)
+
+    def _eintrag(h, quelle, mdi_kind):
+        t = _fenster_titel(u, ctypes, h)
+        datei = _dateiname_aus_text(t)
+        if not datei and not mdi_kind:
+            # Ausserhalb der MDI-Ebene laeuft das ueber ALLE Prozessfenster
+            # (Toolbars, Paletten, ...) — ohne erkennbaren Dateinamen zu
+            # unsicher, um es als Dokument zu fuehren.
+            return None
+        return {'hwnd': int(h), 'titel': t, 'datei': datei,
+                'klasse': _fenster_klasse(u, ctypes, h), 'quelle': quelle,
+                'titel_leer': not bool(t.strip())}
+
+    gefunden, gesehen = [], set()
+    for client in mdi_clients:
+        def _mdikind(h, _l):
+            if u.GetParent(h) == client:
+                # MDI-Ebene: JEDES direkte Kind der MDIClient IST ein
+                # Dokumentfenster (Win32-MDI-Konvention) — nie verwerfen,
+                # nur weil der Titel (noch) keinen Dateinamen zeigt. Ein
+                # maximiertes Kind verschmilzt seinen Titel typischerweise
+                # mit dem Rahmenfenster und liefert hier oft einen leeren
+                # oder unbrauchbaren Titel; das darf das Fenster nicht aus
+                # der Liste werfen (frueher tat es das genau das).
+                e = _eintrag(h, 'mdi', mdi_kind=True)
+                if e and e['hwnd'] not in gesehen:
+                    gesehen.add(e['hwnd']); gefunden.append(e)
+            return True
+        u.EnumChildWindows(client, EnumProc(_mdikind), 0)
+
+    if not gefunden:
+        # Kein MDI (oder VW hat umgebaut): jedes Fenster mit Dateinamen nehmen.
+        for h in oberste + [k[0] for k in kinder]:
+            e = _eintrag(h, 'fenster', mdi_kind=False)
+            if e and e['hwnd'] not in gesehen:
+                gesehen.add(e['hwnd']); gefunden.append(e)
+
+    # Aktives MDI-Kind bestimmen (reine Z-Order-Abfrage, kein Nachrichtenversand).
+    aktiv_hwnd = None
+    if mdi_clients:
+        aktiv_hwnd = _safe(lambda: u.GetTopWindow(mdi_clients[0]), None)
+
+    # Fenster ohne eigenen Dateinamen bestmoeglich aufloesen: wenn eines davon
+    # das aktuell aktive MDI-Kind ist (typischer Fall: maximiertes, aktives
+    # Dokument), den Namen aus dem Titel des Rahmenfensters ableiten. Klar als
+    # 'geraten' markieren — das ist Herleitung, kein direkter Fensterwert.
+    leere = [e for e in gefunden if not e['datei']]
+    if leere and aktiv_hwnd is not None:
+        aus_rahmen = ''
+        for h in oberste:
+            aus_rahmen = _dateiname_aus_text(_fenster_titel(u, ctypes, h))
+            if aus_rahmen:
+                break
+        if aus_rahmen:
+            for e in leere:
+                if e['hwnd'] == aktiv_hwnd:
+                    e['datei'] = aus_rahmen
+                    e['quelle'] = 'mdi-rahmen-titel'
+                    e['geraten'] = True
+
+    diagnose = {'oberste': len(oberste), 'kinder': len(kinder),
+                'mdi_clients': len(mdi_clients), 'aktiv_hwnd': aktiv_hwnd,
+                'unbenannt': len([e for e in gefunden if not e['datei']])}
+    return gefunden, (mdi_clients[0] if mdi_clients else None), diagnose
+
+
+def _grundname(s):
+    s = (s or '').replace('\\', '/').rsplit('/', 1)[-1]
+    return _entstern(s).strip().lower()
+
+
+def list_documents(p):
+    """Every open Vectorworks document, and which one commands land in."""
+    aktiv = _safe(vs.GetFName, '') or ''
+    fenster, _client, diagnose = _dokumentfenster()
+    aktiv_hwnd = diagnose.get('aktiv_hwnd')
+
+    for f in fenster:
+        per_name = bool(f['datei']) and _grundname(f['datei']) == _grundname(aktiv)
+        if aktiv_hwnd is not None:
+            per_hwnd = (f['hwnd'] == aktiv_hwnd)
+            f['aktiv'] = per_hwnd
+            if per_name != per_hwnd:
+                # Namensvergleich und Fenster-Z-Reihenfolge widersprechen sich
+                # — typischer Ausloeser: zwei offene Dateien mit demselben
+                # Basisnamen aus verschiedenen Ordnern. Sichtbar machen statt
+                # stillschweigend eines der beiden Signale zu bevorzugen.
+                f['aktiv_widerspruch'] = True
+        else:
+            f['aktiv'] = per_name
+
+    if not fenster:
+        # Lieber das eine bekannte Dokument melden als eine leere Liste, die
+        # aussieht, als waere nichts offen.
+        return {'status': 'ok', 'aktiv': aktiv, 'anzahl': 1 if aktiv else 0,
+                'dokumente': ([{'datei': aktiv, 'aktiv': True, 'hwnd': None}] if aktiv else []),
+                'hinweis': 'Fenster nicht auffindbar — nur das aktive Dokument ist bekannt.',
+                'diagnose': diagnose}
+
+    return {'status': 'ok', 'aktiv': aktiv, 'anzahl': len(fenster),
+            'dokumente': fenster, 'diagnose': diagnose}
+
+
+def switch_document(p):
+    """Bring another open document to the front. params: name | hwnd.
+
+    The switch is queued, not done: it takes effect after this script
+    returns. Confirm with confirm_active_document (or get_document_info) as
+    the NEXT command — this one only reports what it asked for, never what
+    happened, because it posts WM_MDIACTIVATE rather than sending it (we run
+    on VW's main thread; a send would re-enter the UI mid-script).
+    """
+    teile = _win32()
+    if not teile:
+        return {'error': 'Dokumentwechsel gibt es nur unter Windows.'}
+    u, _pid, ctypes, _wt = teile
+
+    fenster, client, diagnose = _dokumentfenster()
+    if not fenster:
+        return {'error': 'Kein Dokumentfenster gefunden.', 'diagnose': diagnose}
+
+    ziel = None
+    if p.get('hwnd'):
+        gesucht = int(p['hwnd'])
+        ziel = next((f for f in fenster if f['hwnd'] == gesucht), None)
+        if not ziel:
+            return {'error': 'Dieses hwnd ist nicht (mehr) offen.',
+                    'offen': [{'hwnd': f['hwnd'], 'datei': f['datei']} for f in fenster]}
+    else:
+        name = _grundname(p.get('name', ''))
+        if not name:
+            return {'error': 'Bitte name oder hwnd angeben.',
+                    'offen': [f['datei'] for f in fenster if f['datei']]}
+
+        genau = [f for f in fenster if f['datei'] and _grundname(f['datei']) == name]
+        if len(genau) > 1:
+            # Gleicher Basisname, vermutlich verschiedene Ordner. Der
+            # Fenstertitel traegt keinen Pfad, und vs.GetFPathName() liefert
+            # nur den Pfad des AKTIVEN Dokuments — dieser Code kann von hier
+            # aus also grundsaetzlich nicht entscheiden, welches gemeint ist.
+            # Er gibt hwnds zurueck, damit gezielt per hwnd gewechselt (oder
+            # nacheinander gewechselt + mit confirm_active_document anhand
+            # des vollen Pfads geprueft) werden kann.
+            return {'error': 'Mehrdeutig: mehrere offene Dateien mit diesem '
+                              'Basisnamen (evtl. verschiedene Ordner).',
+                    'kandidaten': [{'hwnd': f['hwnd'], 'datei': f['datei'],
+                                     'titel': f['titel']} for f in genau],
+                    'hinweis': 'Mit hwnd erneut aufrufen, oder einzeln '
+                               'wechseln und mit confirm_active_document '
+                               '(expected=voller Pfad) pruefen.'}
+        ziel = genau[0] if genau else None
+
+        if not ziel:   # Teiltreffer, damit "Musterdatei" fuer 260717_Musterdatei.vwx reicht
+            treffer = [f for f in fenster
+                       if f['datei'] and _namens_teiltreffer(name, _grundname(f['datei']))]
+            if len(treffer) > 1:
+                return {'error': 'Mehrdeutig.',
+                        'kandidaten': [{'hwnd': f['hwnd'], 'datei': f['datei'],
+                                         'titel': f['titel']} for f in treffer],
+                        'hinweis': 'Mit hwnd erneut aufrufen.'}
+            ziel = treffer[0] if treffer else None
+
+    if not ziel:
+        unbenannt = [f for f in fenster if not f['datei']]
+        hinweis = None
+        if unbenannt:
+            hinweis = (f'{len(unbenannt)} Fenster ohne lesbaren Dateinamen '
+                       '(vermutlich maximiert, Titel mit Rahmenfenster '
+                       'verschmolzen) — per hwnd ansprechen, siehe "unbenannt".')
+        return {'error': 'Dieses Dokument ist nicht offen.',
+                'offen': [f['datei'] for f in fenster if f['datei']],
+                'unbenannt': [f['hwnd'] for f in unbenannt],
+                'hinweis': hinweis}
+
+    vorher = _safe(vs.GetFName, '') or ''
+    aktiv_hwnd = diagnose.get('aktiv_hwnd')
+    if aktiv_hwnd is not None:
+        # hwnd/Z-Order ist zuverlaessiger als der Namensvergleich, gerade
+        # weil zwei gleichnamige Dateien den Namensvergleich sonst fuer
+        # BEIDE Fenster faelschlich "bereits aktiv" melden koennten.
+        bereits_aktiv = (ziel['hwnd'] == aktiv_hwnd)
+    else:
+        bereits_aktiv = bool(ziel['datei']) and _grundname(ziel['datei']) == _grundname(vorher)
+
+    if bereits_aktiv:
+        return {'status': 'ok', 'aktiv': vorher, 'gewechselt': False,
+                'hinweis': 'Dieses Dokument ist bereits vorn.'}
+
+    WM_MDIACTIVATE = 0x0222
+    SW_RESTORE = 9
+    if client and ziel.get('quelle') in ('mdi', 'mdi-rahmen-titel'):
+        u.PostMessageW(client, WM_MDIACTIVATE, ziel['hwnd'], 0)
+    else:
+        if u.IsIconic(ziel['hwnd']):
+            u.ShowWindow(ziel['hwnd'], SW_RESTORE)
+        u.SetForegroundWindow(ziel['hwnd'])
+
+    return {'status': 'angestossen', 'ziel': ziel['datei'] or f"hwnd:{ziel['hwnd']}",
+            'ziel_hwnd': ziel['hwnd'], 'vorher': vorher,
+            'geraten': bool(ziel.get('geraten')),
+            'hinweis': 'Der Wechsel greift, sobald dieses Skript zurueck ist. '
+                       'Mit confirm_active_document bestaetigen — diese '
+                       'Antwort belegt ihn nicht.'}
+
+
+def _hold(p):
+    """Pin the (already activated) document to the front for a screenshot.
+    The pump records the hold; this only reports where we are."""
+    return {'status': 'ok', 'dokument': _safe(vs.GetFName, '') or ''}
+
+
+def _release(p):
+    """End a _hold (the pump clears it)."""
+    return {'status': 'ok'}
+
+
+def close_document(p):
+    """Close the ACTIVE document (the v14 pump has already brought the
+    requested one to the front and verified it). params: save (default True),
+    force (close without saving — Vectorworks will ask if there are changes).
+
+    The close is POSTED (WM_CLOSE to the document window), not executed here:
+    this script runs inside the very document being closed, and tearing it
+    down underneath a running script is exactly the kind of context change VW
+    does not survive. The message is handled after the script returns. Saving
+    happens now, synchronously, via the Save menu command (same as
+    save_document). A never-saved document is refused — Save would open the
+    Save-As dialog and block the bridge.
+    """
+    name = _safe(vs.GetFName, '') or ''
+    path = _safe(vs.GetFPathName, '') or ''
+    save = p.get('save', True)
+    if save and not path:
+        return {'error': '%s was never saved — Save would open a dialog. '
+                         'Use save_document_as first.' % name, 'code': 'DOC_UNSAVED'}
+    if not save and not p.get('force'):
+        return {'error': 'save=False needs force=True: Vectorworks asks before '
+                         'discarding changes, and that dialog blocks the bridge.',
+                'code': 'DOC_CLOSE_NEEDS_FORCE'}
+    teile = _win32()
+    if not teile:
+        return {'error': 'Schliessen gibt es nur unter Windows.'}
+    u, _pid, _ctypes, _wt = teile
+    fenster, _client, diagnose = _dokumentfenster()
+    aktiv_hwnd = diagnose.get('aktiv_hwnd')
+    if not aktiv_hwnd:
+        return {'error': 'aktives Dokumentfenster nicht gefunden', 'diagnose': diagnose}
+    if save:
+        # NOT DoMenuTextByName('Save'): like every menu command it is queued
+        # and runs after this script — i.e. after the WM_CLOSE below, so
+        # Vectorworks asked "save changes?" and that modal blocked the whole
+        # bridge for 15 minutes (2026-10-06). SaveActiveDocument saves NOW,
+        # without dialogs, and reports success.
+        rc = _safe(lambda: vs.SaveActiveDocument(path), None)
+        if rc not in (0, True, None):
+            return {'error': 'Speichern fehlgeschlagen (rc=%r) — nicht geschlossen.' % (rc,),
+                    'code': 'DOC_SAVE_FAILED'}
+        if rc is None:
+            return {'error': 'SaveActiveDocument nicht ausfuehrbar — nicht geschlossen, '
+                             'damit kein Sichern-Dialog die Bridge blockiert.',
+                    'code': 'DOC_SAVE_FAILED'}
+    WM_CLOSE = 0x0010
+    u.PostMessageW(aktiv_hwnd, WM_CLOSE, 0, 0)
+    return {'status': 'angestossen', 'dokument': name, 'gespeichert': bool(save),
+            'hinweis': 'Das Fenster schliesst, sobald dieses Skript zurueck ist; '
+                       'list_documents bestaetigt es.'}
 
 
 # ── Layers ──────────────────────────────────────────────────────────────────
@@ -354,19 +773,35 @@ def set_layer_scale(p):
 # ── Classes ─────────────────────────────────────────────────────────────────
 
 def get_classes(p):
-    count = vs.ClassNum()
+    """List document classes (name, index, visibility).
+
+    VW2026 status of ClassList is unclear: vs_index.json lists it as a real
+    function (STRING ClassList(index)), but a comment elsewhere in this file
+    claims VW2026 removed class-name enumeration entirely. Resolve that by
+    trying ClassList first and reporting which method actually produced the
+    result — never fabricate a name.
+    """
+    count = _safe(lambda: vs.ClassNum(), 0) or 0
     classes = []
-    for i in range(1, count + 1):
-        # VW2026 exposes ClassList(index); GetClName does not exist and the
-        # old fallback produced fake "Class_1" names that looked authoritative.
-        n = _safe(lambda i=i: vs.ClassList(i), '')
-        if not n:
-            continue
-        classes.append({
-            'name': n, 'index': i,
-            'visible': _safe(lambda: vs.GetCVis(n) == 0),
-        })
-    return {'classes': classes, 'count': len(classes)}
+    method = 'ClassList'
+    try:
+        collected = []
+        for i in range(1, count + 1):
+            n = vs.ClassList(i)
+            if not isinstance(n, str) or not n:
+                raise ValueError(f'ClassList({i}) returned {n!r}')
+            collected.append((i, n))
+        classes = [{'name': n, 'index': i,
+                    'visible': _safe(lambda n=n: vs.GetCVis(n) == 0)}
+                   for i, n in collected]
+    except Exception:
+        # ClassList failed (or doesn't exist on this build) -- fall back to
+        # walking geometry for class names actually in use.
+        method = 'objects_used'
+        classes = [{'name': n, 'index': None,
+                    'visible': _safe(lambda n=n: vs.GetCVis(n) == 0)}
+                   for n in _class_names_used()]
+    return {'classes': classes, 'count': len(classes), 'method': method}
 
 def _class_names_all():
     """Return every document class, including classes with no objects yet."""
@@ -378,21 +813,20 @@ def _class_names_all():
     return out
 
 def get_class_styles(p):
-    """Per-class appearance for QGIS/GIS styling (VW2026-safe).
-    Pass {'names': [...]} to narrow the readback. Colors returned as 0-255 RGB."""
-    names = p.get('names') or _class_names_all()
+    """Per-class appearance for QGIS/GIS styling and Buero-Standard audits
+    (VW2026-safe). Pass {'names': [...]} to read specific classes; otherwise
+    all classes in the document are enumerated via _enumerate_class_names
+    (ClassList first, object-walk fallback -- reported as name_source).
+    Colors returned as 0-255 RGB."""
+    explicit = p.get('names')
+    if explicit:
+        names, name_source = explicit, 'explicit'
+    else:
+        names, name_source = _enumerate_class_names()
     out = {}
     for nm in names:
-        d = {}
-        ff = _safe(lambda: vs.GetClFillFore(nm))
-        d['fill'] = [_c255(ff[0]), _c255(ff[1]), _c255(ff[2])] if ff else None
-        pf = _safe(lambda: vs.GetClPenFore(nm))
-        d['pen'] = [_c255(pf[0]), _c255(pf[1]), _c255(pf[2])] if pf else None
-        d['lineweight'] = _safe(lambda: vs.GetClLW(nm))      # VW mils; mm = lw * 0.0254
-        d['fill_pattern'] = _safe(lambda: vs.GetClFPat(nm))  # 0=none, 1/2=solid, 14=hatch, neg=tile
-        d['visible'] = _safe(lambda: vs.GetCVis(nm) == 0)
-        out[nm] = d
-    return {'count': len(out), 'classes': out}
+        out[nm] = _read_class_appearance(nm)
+    return {'count': len(out), 'classes': out, 'name_source': name_source}
 
 def create_class(p):
     name = p.get('name', '')
@@ -430,7 +864,30 @@ def rename_class(p):
         return {'error': str(e)}
 
 def set_class_appearance(p):
+    """Set one class's fill/pen color, line weight, fill pattern, line style,
+    opacity and/or hatch. Every field is optional and touched ONLY when its
+    key is present in params — existing callers passing just colors and
+    line_weight keep working unchanged.
+
+    CALLER CAVEATS (unresolved without a running VW2026 instance — see the
+    accompanying report for detail):
+      - fill_pattern's numbering (0/1/2/14/negative) is an inherited office
+        convention, not confirmed by vs_index.json.
+      - hatch (SetClVectorFill) selects WHICH hatch; it is not confirmed
+        whether it alone switches the class into hatch mode, or whether
+        fill_pattern must also be set (commonly to 14) for it to render.
+        This function does NOT set fill_pattern as a side effect of hatch —
+        pass both explicitly if the office convention needs both.
+      - opacity is vs.GetClOpacity/SetClOpacity's own percentage. Standard
+        terminology has 100=fully opaque, 0=invisible — the LIKELY OPPOSITE
+        of a "transparenz" column where 0=opaque. If the source data is
+        "transparenz", convert with opacity = 100 - transparenz before
+        calling this tool; this function does not attempt that conversion.
+      - line_style is always a VW line-style resource NUMBER (LONGINT); no
+        vs.* function in the index resolves a style NAME to that number.
+    """
     name = p.get('name', '')
+    result = {'status': 'ok', 'class': name}
     try:
         if any(k in p for k in ('fill_r', 'fill_g', 'fill_b')):
             r = _c8(p.get('fill_r', 255))
@@ -448,7 +905,22 @@ def set_class_appearance(p):
             # VW lineweight is mil = mm * ~3.9 (1 mil = 1/1000 inch). VW API uses mils.
             mm = float(p['line_weight'])
             vs.SetClLW(name, int(mm * 100))   # LW units in VW are 0.01mm mils-ish
-        return {'status': 'ok'}
+        if 'fill_pattern' in p and p['fill_pattern'] is not None:
+            vs.SetClFPat(name, int(p['fill_pattern']))
+        if 'hatch' in p and p['hatch'] is not None:
+            ok = _safe(lambda: vs.SetClVectorFill(name, str(p['hatch'])), False)
+            result['hatch_applied'] = bool(ok)
+            if not ok:
+                result['hatch_warning'] = (
+                    f"SetClVectorFill returned False for hatch '{p['hatch']}' "
+                    "— name likely not found among the document's hatch resources"
+                )
+        if 'opacity' in p and p['opacity'] is not None:
+            pct = max(0, min(100, int(round(float(p['opacity'])))))
+            vs.SetClOpacity(name, pct)
+        if 'line_style' in p and p['line_style'] is not None:
+            result['line_style_path'] = _set_class_line_style(name, p['line_style'])
+        return result
     except Exception as e:
         return {'error': str(e)}
 
@@ -764,18 +1236,17 @@ def draw_sphere(p):
         _restore(prev)
 
 def draw_cone(p):
+    """Draw a 3D cone (apex above the base center). Returns object id."""
     prev = _with_layer_class(p)
     try:
-        cx, cy, cz = p.get('cx',0), p.get('cy',0), p.get('cz',0)
+        cx, cy, cz = p.get('cx', 0), p.get('cy', 0), p.get('cz', 0)
         r = p.get('radius', 50); ht = p.get('height', 100)
-        # Create via rotate of triangle — simpler: use CreateCone if exists
         try:
-            h = vs.CreateCone((cx, cy, cz), (0, 0, 1), r, 0, ht)
-        except Exception:
-            # Fallback: polygon + sweep
-            vs.Poly((cx, cy), (cx+r, cy), (cx, cy+ht))
-            rh = vs.LNewObj()
-            h = vs.Sweep(rh, 0, 360, 16, False)
+            h = vs.CreateCone((cx, cy, cz), (cx, cy, cz + ht), r)
+        except Exception as e:
+            return {'error': str(e)}
+        if not h:
+            return {'error': 'CreateCone returned no object'}
         return {'status': 'ok', 'object_id': _oid(h)}
     finally:
         _restore(prev)
@@ -4064,19 +4535,34 @@ def set_text_size_all(p):
 
 def convert_to_polygon(p):
     """Convert any 2D object to a polygon (arcs tessellated). params:
-    {object_id, resolution (segments per arc, default 32)}. Original untouched."""
+    {object_id, resolution (segments per arc, default 32)}. Original untouched.
+    vs.ConvertToPolygon takes TWO arguments (h, resolution) — a second, later
+    definition of this command used to shadow this one and called it with one,
+    which is an engine error, not a fallback."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'object not found'}
-    r = vs.ConvertToPolygon(h, int(p.get('resolution', 32)))
+    r = _safe(lambda: vs.ConvertToPolygon(h, int(p.get('resolution', 32))))
+    if not r: return {'error': 'ConvertToPolygon returned nothing'}
     return {'status': 'ok', 'object_id': _oid(r)}
 
 def convert_to_polyline(p):
     """Convert a 2D object to a polyline (arcs preserved as arc vertices).
-    params: {object_id}. Original untouched."""
+    params: {object_id, replace (default False)}.
+
+    Two different VW calls hide behind this name, and a duplicate definition
+    used to pick the second one silently while this docstring promised the
+    first:
+      MakePolyline(src)      -- builds a NEW polyline, source stays (default)
+      ConvertToPolyline(h)   -- converts the shape itself (replace=True)
+    """
     h = _h(p.get('object_id'))
     if not h: return {'error': 'object not found'}
-    r = vs.MakePolyline(h)
-    return {'status': 'ok', 'object_id': _oid(r)}
+    if p.get('replace'):
+        r = _safe(lambda: vs.ConvertToPolyline(h))
+    else:
+        r = _safe(lambda: vs.MakePolyline(h))
+    if not r: return {'error': 'conversion returned nothing'}
+    return {'status': 'ok', 'object_id': _oid(r), 'replaced': bool(p.get('replace'))}
 
 def set_stacking_order(p):
     """Move object in the drawing stacking order. params: {object_id,
@@ -4160,8 +4646,12 @@ def get_object_metrics(p):
     """Area + perimeter of a 2D object (doc units). params: {object_id}."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'object not found'}
-    return {'status': 'ok', 'area': _safe(lambda: vs.HArea(h)),
-            'perimeter': _safe(lambda: vs.HPerim(h))}
+    # HArea returns None on VW2027 (live 2026-10-23, closed polygon of
+    # 17.77 m2); HAreaN works. Keep HArea only as a fallback.
+    area = _safe(lambda: vs.HAreaN(h))
+    if area is None:
+        area = _safe(lambda: vs.HArea(h))
+    return {'status': 'ok', 'area': area, 'perimeter': _safe(lambda: vs.HPerim(h))}
 
 def get_document_units(p):
     """Current document unit settings (raw GetUnits tuple: fraction, display,
@@ -4307,14 +4797,12 @@ def get_poly_holes(p):
 
 
 # ── SDK enrichment 3: report worksheets, IFC deep, textures, doc defaults ───
-
-def _col_letter(i):
-    """1 -> A, 2 -> B, ... 27 -> AA (worksheet column letters)."""
-    s = ''
-    while i > 0:
-        i, r = divmod(i - 1, 26)
-        s = chr(65 + r) + s
-    return s
+# (_col_letter, a 1->A/27->AA worksheet-column-letter helper, used to live
+# here. Removed: create_report_worksheet below never referenced it — its
+# worksheet API is purely row/col-index numeric, not column-letter based —
+# and grep found no other caller in the file either. Dead code with no
+# runtime risk, but pure clutter next to the function it looked like it was
+# written for.)
 
 def create_report_worksheet(p):
     """One-call criteria-driven report (database worksheet): creates the
@@ -4513,18 +5001,36 @@ def ifc_remove_pset(p):
 
 def ifc_define_pset(p):
     """Define a custom pset schema (document-wide). params: {name,
-    members:[{name, type}]} — type is an IFC type string like 'IfcLabel',
-    'IfcReal', 'IfcBoolean', 'IfcLengthMeasure'."""
+    members:[{name, type}], ersetzen: bool} -- type is an IFC type string like
+    'IfcLabel', 'IfcReal', 'IfcBoolean', 'IfcLengthMeasure'. ersetzen defaults
+    to True (old behavior: silently overwrites/redefines). Pass ersetzen=False
+    to abort instead of touching an existing pset of the same name.
+    IFC_DefPsetBegin itself has no documented "refuse if exists" behavior --
+    the index gives no hint either way, so the guard is enforced in Python via
+    IFC_IsPsetDefined BEFORE DefPsetBegin is ever called, rather than trusting
+    the engine to reject the duplicate on its own.
+    The Begin/End pair is wrapped in try/finally (house rule: DefPsetBegin/
+    DefPsetEnd is an open-ended Begin/End pair like BeginSym/EndSym -- if a
+    malformed member dict or any other exception fires between Begin and End,
+    the pset definition must not stay open). Begin is only ever called AFTER
+    the name/members/ersetzen precheck succeeds, so a failed precheck never
+    leaves an empty pset definition behind."""
     name = p.get('name')
     members = p.get('members') or []
+    ersetzen = p.get('ersetzen', True)
     if not name or not members: return {'error': 'name + members required'}
+    if not ersetzen and bool(_safe(lambda: vs.IFC_IsPsetDefined(name), False)):
+        return {'error': f'pset "{name}" already defined and ersetzen=False',
+                'already_defined': True}
     if not vs.IFC_DefPsetBegin(name): return {'error': 'DefPsetBegin failed'}
     added = 0
-    for m in members:
-        if vs.IFC_DefPsetAddMember(name, m.get('name', ''), m.get('type', 'IfcLabel')):
-            added += 1
-    ok = vs.IFC_DefPsetEnd(name)
-    return {'status': 'ok', 'defined': bool(ok), 'members_added': added}
+    try:
+        for m in members:
+            if vs.IFC_DefPsetAddMember(name, m.get('name', ''), m.get('type', 'IfcLabel')):
+                added += 1
+    finally:
+        ok = bool(_safe(lambda: vs.IFC_DefPsetEnd(name), False))
+    return {'status': 'ok', 'defined': ok, 'members_added': added}
 
 def ifc_get_entity_prop(p):
     """Read a direct IFC entity attribute (Name, Description, Tag, ...).
@@ -4685,12 +5191,21 @@ def set_default_marker(p):
 
 
 def boolean_operation(p):
+    """3D boolean operation on two solids. operation: add/subtract/intersect.
+    Returns the resulting object id (the two source objects are consumed)."""
     h1 = _h(p.get('object_id_a'))
     h2 = _h(p.get('object_id_b'))
     if not h1 or not h2: return {'error': 'Objects not found'}
-    op = {'add': 0, 'subtract': 1, 'intersect': 2}.get(p.get('operation', 'add'), 0)
+    op = p.get('operation', 'add')
+    fn = {'add': vs.AddSolid,
+          'subtract': vs.SubtractSolid,
+          'intersect': vs.IntersectSolid}.get(op)
+    if fn is None:
+        return {'error': f"Unknown operation: {op!r} (use add/subtract/intersect)"}
     try:
-        nh = vs.CSGOperation(h1, h2, op)
+        nh = fn(h1, h2)
+        if not nh:
+            return {'error': 'Boolean operation returned no result object'}
         return {'status': 'ok', 'object_id': _oid(nh)}
     except Exception as e:
         return {'error': str(e)}
@@ -4714,26 +5229,60 @@ def _named_view_angles(view):
 
 
 def set_3d_view(p):
-    """Set a named VW2026 view using SetView's verified six-argument signature."""
-    view = str(p.get('view') or 'top').lower()
-    angles = _named_view_angles(view)
-    if not angles:
-        return {'error': 'unknown view', 'view': view,
-                'valid_views': sorted(_NAMED_VIEW_ANGLES)}
-    if not vcheck('SetView', 6):
-        return {'error': 'SetView signature index does not accept six arguments'}
-    vs.SetView(angles[0], angles[1], angles[2], 0.0, 0.0, 0.0)
-    return {'status': 'ok', 'view': view,
-            'angles': {'x': angles[0], 'y': angles[1], 'z': angles[2]},
-            'offset': {'x': 0.0, 'y': 0.0, 'z': 0.0}}
+    """Set the document's 3D view to a standard direction
+    (top/front/back/right/left/bottom/iso/iso_right/iso_left/trimetric)."""
+    view = p.get('view', 'top')
+    # (camera_location_direction, up_vector); target is always the origin.
+    views = {
+        'top':       ((0, 0, 1),   (0, 1, 0)),
+        'bottom':    ((0, 0, -1),  (0, -1, 0)),
+        'front':     ((0, -1, 0),  (0, 0, 1)),
+        'back':      ((0, 1, 0),   (0, 0, 1)),
+        'right':     ((1, 0, 0),   (0, 0, 1)),
+        'left':      ((-1, 0, 0),  (0, 0, 1)),
+        'iso':       ((1, -1, 1),  (0, 0, 1)),
+        'iso_right': ((1, -1, 1),  (0, 0, 1)),
+        'iso_left':  ((-1, -1, 1), (0, 0, 1)),
+        'trimetric': ((-1, -1, 1), (0, 0, 1)),
+    }
+    loc, up = views.get(view, views['top'])
+    try:
+        vs.SetViewVector(loc, (0, 0, 0), up)
+        return {'status': 'ok', 'view': view}
+    except Exception as e:
+        return {'error': str(e)}
 
 
 # ── Symbols ─────────────────────────────────────────────────────────────────
 
+def _resource_names(res_type):
+    """Names of document resources of one type via BuildResourceList.
+
+    ForEachObject criteria like 'T=SYMDEF' walk drawing objects and never see
+    resources, so `_collect` returned nothing for symbol definitions and
+    record formats on VW2026 (verified 2026-09-11: 12 symbols, 16 formats
+    present, both reported 0). BuildResourceList is the resource browser's own
+    enumeration. Type 16 = symbol definition, 47 = record format, 11 = hatch."""
+    try:
+        list_id, n = vs.BuildResourceList(res_type, 0, '')
+    except Exception:
+        return []
+    names = []
+    for i in range(1, (n or 0) + 1):
+        nm = _safe(lambda: vs.GetNameFromResourceList(list_id, i))
+        if nm:
+            names.append(nm)
+    return names
+
+
 def get_symbols(p):
     syms = []
-    for h in _collect('T=SYMDEF'):
-        syms.append({'name': _safe(lambda: vs.GetName(h)), 'object_id': _oid(h)})
+    for nm in _resource_names(16):
+        h = _safe(lambda: vs.GetObject(nm))
+        syms.append({'name': nm, 'object_id': _oid(h) if h else None})
+    if not syms:                                   # old path as a fallback
+        for h in _collect('T=SYMDEF'):
+            syms.append({'name': _safe(lambda: vs.GetName(h)), 'object_id': _oid(h)})
     return {'symbols': syms, 'count': len(syms)}
 
 def place_symbol(p):
@@ -4758,25 +5307,62 @@ def get_symbol_instances(p):
     return {'objects': [_summary(h) for h in hs], 'count': len(hs)}
 
 def create_symbol_from_objects(p):
-    # VW2026: no SymbolCreate. BeginSym/EndSym captures objects CREATED between
-    # the calls into a new symbol def; duplicate the source objects into that
-    # scope so the originals stay on the drawing.
+    """Create a symbol definition from existing objects (duplicated into a
+    new symbol scope; originals stay on the drawing). VW2026 has no
+    vs.CreateSymbolFromObjects — this wraps BeginSym/HDuplicate/EndSym.
+    All object_ids are resolved to handles FIRST; BeginSym(name) is only
+    called if at least one resolves, so a call with every object_id invalid
+    creates NO symbol definition at all instead of an empty one.
+    try/except/finally guarantees EndSym always runs once BeginSym has run,
+    even if a duplicate call or anything else raises mid-loop: leaving the
+    symbol-recording context open would silently capture every object drawn
+    afterward into this definition."""
     name = p.get('name', 'NewSymbol')
     ids = p.get('object_ids', [])
     if not ids:
         return {'error': 'object_ids required'}
-    vs.BeginSym(name)
-    made = 0
+
+    resolved, failed = [], []
     for oid in ids:
         h = _h(oid)
         if h:
+            resolved.append(h)
+        else:
+            failed.append(oid)
+    if not resolved:
+        return {'error': 'no source objects resolved (all object_ids invalid); '
+                          'BeginSym was NOT called, no empty symbol was created',
+                'failed': failed}
+
+    began = False
+    made = 0
+    dup_failed = []
+    try:
+        vs.BeginSym(name)
+        began = True
+        for h in resolved:
             d = _safe(lambda h=h: vs.HDuplicate(h, 0, 0))
             if d:
                 made += 1
-    vs.EndSym()
+            else:
+                dup_failed.append(_oid(h))
+    except Exception as e:
+        return {'error': f'create_symbol_from_objects failed: {e}',
+                'made': made, 'failed': failed + dup_failed}
+    finally:
+        if began:
+            _safe(lambda: vs.EndSym())
+
     if made == 0:
-        return {'error': 'no source objects resolved'}
-    return {'status': 'ok', 'name': name, 'objects': made}
+        return {'error': "all HDuplicate calls failed inside BeginSym/EndSym "
+                          f"-- an EMPTY symbol definition named '{name}' was "
+                          "left behind; delete it manually if unwanted",
+                'failed': failed + dup_failed}
+    result = {'status': 'ok', 'name': name, 'objects': made}
+    all_failed = failed + dup_failed
+    if all_failed:
+        result['failed'] = all_failed
+    return result
 
 def delete_symbol(p):
     name = p.get('name', '')
@@ -4867,11 +5453,16 @@ def set_marker(p):
 
 def get_record_formats(p):
     fmts = []
-    for h in _collect('T=RECDEF'):
-        n = _safe(lambda: vs.GetName(h))
-        if n:
-            fmts.append({'name': n, 'object_id': _oid(h),
-                         'field_count': _safe(lambda: vs.NumFields(h), 0)})
+    for n in _resource_names(47):
+        h = _safe(lambda: vs.GetObject(n))
+        fmts.append({'name': n, 'object_id': _oid(h) if h else None,
+                     'field_count': _safe(lambda: vs.NumFields(h), 0) if h else None})
+    if not fmts:                                   # old path as a fallback
+        for h in _collect('T=RECDEF'):
+            n = _safe(lambda: vs.GetName(h))
+            if n:
+                fmts.append({'name': n, 'object_id': _oid(h),
+                             'field_count': _safe(lambda: vs.NumFields(h), 0)})
     return {'formats': fmts, 'count': len(fmts)}
 
 def get_object_records(p):
@@ -4913,10 +5504,11 @@ def attach_record(p):
     return {'status': 'ok'}
 
 def detach_record(p):
+    """Detach a record from an object."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        vs.RemoveRecord(h, p.get('record_name', ''))
+        vs.DelRecord(h, p.get('record_name', ''))
         return {'status': 'ok'}
     except Exception as e:
         return {'error': str(e)}
@@ -4964,23 +5556,151 @@ def set_ifc_entity(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        vs.IFC_SetIFCEntity(h, p.get('entity', 'IfcBuildingElement'), '', '')
-        return {'status': 'ok'}
+        # Two arguments (vs_index). The old call passed four and tripped an
+        # engine error. NOTE: changing the entity DROPS every attached pset —
+        # ifc_set_entity_keep_psets re-attaches them (2026-10-23).
+        ok = vs.IFC_SetIFCEntity(h, p.get('entity', 'IfcBuildingElementProxy'))
+        if not ok:
+            return {'error': 'entity not accepted by the active IFC scheme: %s' % p.get('entity')}
+        return {'status': 'ok', 'entity': p.get('entity')}
     except Exception as e:
         return {'error': str(e)}
+
+# ---- IFC pset snapshot / restore -------------------------------------------
+# Enumeration works through the pset DEFINITION, not the object: the object
+# names its psets (IFC_GetNumPsets / IFC_GetPsetName, 1-based), the definition
+# lists the property names (IFC_GetNumPsetProps / IFC_GetPsetPropName,
+# 1-based), and IFC_GetPsetProp(h, pset, prop) returns (ok, value, typeCode).
+# Every getter returns an (ok, value) tuple. Verified on VW2027, 2026-10-23.
+
+def _ifc_v(x):
+    return x[1] if isinstance(x, tuple) else x
+
+_IFC_PROP_NAMES = {}
+
+def _ifc_prop_names(pset):
+    if pset not in _IFC_PROP_NAMES:
+        n = int(_ifc_v(vs.IFC_GetNumPsetProps(pset)) or 0)
+        names = (_ifc_v(vs.IFC_GetPsetPropName(pset, i)) for i in range(1, n + 1))
+        _IFC_PROP_NAMES[pset] = [x for x in names if x]
+    return _IFC_PROP_NAMES[pset]
+
+def _ifc_pset_snapshot(h):
+    """{pset: {prop: value-as-string}} for every attached pset; empty values skipped."""
+    out = {}
+    n = int(_ifc_v(vs.IFC_GetNumPsets(h)) or 0)
+    for i in range(1, n + 1):
+        ps = _ifc_v(vs.IFC_GetPsetName(h, i))
+        if not ps:
+            continue
+        out[ps] = {}
+        for prop in _ifc_prop_names(ps):
+            r = vs.IFC_GetPsetProp(h, ps, prop)
+            if r[0] and str(r[1]) != '':
+                out[ps][prop] = str(r[1])
+    return out
+
+def _ifc_pset_restore(h, snap):
+    for ps, values in snap.items():
+        vs.IFC_AttachPset(h, ps)
+        for prop, val in values.items():
+            vs.IFC_SetPsetProp(h, ps, prop, val)
 
 def get_ifc_properties(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        # IFC property enumeration — best-effort via IFC_GetPSetAttribute iteration
-        psets = {}
-        # No full enumeration API; return placeholder with entity
-        ok, entity = vs.IFC_GetIFCEntity(h)
-        return {'entity': entity if ok else '', 'psets': psets,
-                'note': 'Full pset enumeration requires IFC_PSetList API'}
+        e2 = vs.IFC_GetIFCEntity2(h)   # (ok, source 1=mapping 2=record, effective, mapped)
+        return {'entity': _ifc_v(vs.IFC_GetIFCEntity(h)) or '',
+                'effective_entity': e2[2], 'mapping_entity': e2[3],
+                'source': {0: 'none', 1: 'data mapping', 2: 'object record'}.get(e2[1], e2[1]),
+                'name': _ifc_v(vs.IFC_GetEntityProp(h, 'Name')),
+                'psets': _ifc_pset_snapshot(h)}
     except Exception as e:
         return {'error': str(e)}
+
+def ifc_set_entity_keep_psets(p):
+    """Change the IFC class of many objects WITHOUT losing their property sets.
+
+    IFC_SetIFCEntity silently drops every attached pset (verified 2026-10-23:
+    a pipe lost Pset_LILASp). This snapshots, switches, restores and compares.
+
+    params: entity (required), criteria OR object_ids, name (optional IFC Name
+    for objects whose Name is empty or a generated '<uuid>IfcXxx'), dry_run.
+    """
+    import re
+    entity = p.get('entity')
+    if not entity:
+        return {'error': 'entity required'}
+    handles = []
+    if p.get('object_ids'):
+        handles = [h for h in (_h(u) for u in p['object_ids']) if h]
+    elif p.get('criteria'):
+        vs.ForEachObject(lambda h: handles.append(h), p['criteria'])
+    else:
+        return {'error': 'criteria or object_ids required'}
+    junk = re.compile(r'^([0-9a-f-]{36})?Ifc\w+$')
+    stats, problems = {}, []
+    for h in handles:
+        cur = _ifc_v(vs.IFC_GetIFCEntity(h)) or 'none'
+        if cur == entity:
+            stats['already'] = stats.get('already', 0) + 1
+            continue
+        key = '%s <- %s' % (entity, cur)
+        stats[key] = stats.get(key, 0) + 1
+        if p.get('dry_run'):
+            continue
+        before = _ifc_pset_snapshot(h)
+        if not vs.IFC_SetIFCEntity(h, entity):
+            problems.append({'object_id': _oid(h), 'error': 'entity rejected by IFC scheme'})
+            continue
+        _ifc_pset_restore(h, before)
+        nm = str(_ifc_v(vs.IFC_GetEntityProp(h, 'Name')) or '')
+        if p.get('name') and (not nm or junk.match(nm)):
+            vs.IFC_SetEntityProp(h, 'Name', p['name'])
+        if _ifc_pset_snapshot(h) != before:
+            problems.append({'object_id': _oid(h), 'error': 'pset values differ after restore'})
+    return {'status': 'ok', 'matched': len(handles), 'changes': stats,
+            'problems': problems[:20], 'n_problems': len(problems), 'dry_run': bool(p.get('dry_run'))}
+
+def ifc_audit(p):
+    """Effective IFC class per object kind: where it comes from (object record
+    vs data mapping) and where the two disagree. Proxies and *Type entities on
+    instances are flagged — both export wrong.
+
+    params: criteria (required; scope it to layers, e.g. "(L='EG')" —
+    a whole-document walk freezes big files).
+    """
+    crit = p.get('criteria')
+    if not crit:
+        return {'error': "criteria required (e.g. \"(L='EG')\") — full-document walks freeze big files"}
+    groups = {}
+    def visit(h):
+        t = vs.GetTypeN(h)
+        kind = (vs.GetName(vs.GetParametricRecord(h)) if t == 86 else
+                vs.GetSymName(h) if t == 15 else 'type %d' % t)
+        try:
+            e2 = vs.IFC_GetIFCEntity2(h)
+            eff, mapped, src = e2[2] or '(none)', e2[3] or '', e2[1]
+        except Exception:
+            eff, mapped, src = '(error)', '', -1
+        k = (vs.GetLName(vs.GetLayer(h)), kind, eff, mapped, src)
+        g = groups.setdefault(k, {'count': 0, 'example': _oid(h)})
+        g['count'] += 1
+    vs.ForEachObject(visit, crit)
+    rows = []
+    for (layer, kind, eff, mapped, src), g in sorted(groups.items()):
+        flags = []
+        if eff == 'IfcBuildingElementProxy':
+            flags.append('proxy')
+        if eff.endswith('Type'):
+            flags.append('type entity on instance')
+        if mapped and eff != mapped:
+            flags.append('record overrides mapping (%s)' % mapped)
+        rows.append({'layer': layer, 'kind': kind, 'entity': eff, 'mapping': mapped,
+                     'source': {0: 'none', 1: 'mapping', 2: 'record'}.get(src, src),
+                     'count': g['count'], 'example': g['example'], 'flags': flags})
+    return {'status': 'ok', 'scheme': _ifc_v(vs.IFC_GetIFCScheme()), 'groups': rows}
 
 def set_ifc_property(p):
     h = _h(p.get('object_id'))
@@ -5090,26 +5810,23 @@ def get_walls(p):
 # ── Landscape / Plants ──────────────────────────────────────────────────────
 
 def get_plants(p):
+    """Get all plant objects with parametric record data (Botanischer Name, Höhe, etc.)."""
     parts = ['T=PLUGINOBJ']
     if p.get('layer'): parts.append(f"L='{p['layer']}'")
     hs = _collect(' & '.join(parts), p.get('limit', 500))
     plants = []
     for h in hs:
-        # Keep only actual plant plugin objects
-        plugin_name = _safe(lambda: vs.GetPluginType(h), '') or ''
-        if 'plant' not in plugin_name.lower() and 'pflanz' not in plugin_name.lower():
+        prec = _safe(lambda: vs.GetParametricRecord(h))
+        rec_name = _safe(lambda: vs.GetName(prec), '') if prec else ''
+        rec_name = rec_name or ''
+        if 'plant' not in rec_name.lower() and 'pflanz' not in rec_name.lower():
             continue
         s = _summary(h)
-        s['plugin_name'] = plugin_name
-        prec = _safe(lambda: vs.GetParametricRecord(h))
-        if prec:
-            rec_name = _safe(lambda: vs.GetName(prec), '')
-            s['record_name'] = rec_name
-            s['plant_fields'] = {}
-            for i in range(1, _safe(lambda: vs.NumFields(prec), 0) + 1):
-                fn = _safe(lambda: vs.GetFldName(prec, i), f'f{i}')
-                s['plant_fields'][fn] = _safe(
-                    lambda: vs.GetRField(h, rec_name, fn), '')
+        s['record_name'] = rec_name
+        s['plant_fields'] = {}
+        for i in range(1, _safe(lambda: vs.NumFields(prec), 0) + 1):
+            fn = _safe(lambda: vs.GetFldName(prec, i), f'f{i}')
+            s['plant_fields'][fn] = _safe(lambda: vs.GetRField(h, rec_name, fn), '')
         plants.append(s)
     return {'plants': plants, 'count': len(plants)}
 
@@ -5195,8 +5912,17 @@ def update_site_model(p):
     return {'status': 'ok', 'updated': len(hs)}
 
 def get_terrain_elevation(p):
+    """Get terrain elevation at a point (x, y) in document units, from the
+    site model on the active layer (same DTM6_GetZatXY call as get_z_at_xy)."""
+    dtm_h = _active_dtm()
+    if not dtm_h:
+        return {'error': 'No site model on active layer'}
+    x = float(p.get('x', 0)); y = float(p.get('y', 0))
+    tin_type = int(p.get('tin_type', 2))
     try:
-        z = vs.GetZFromSiteModel(p.get('x', 0), p.get('y', 0))
+        ok, z = vs.DTM6_GetZatXY(dtm_h, x, y, tin_type)
+        if not ok:
+            return {'error': f'Point ({x}, {y}) is outside the site model'}
         return {'elevation': z}
     except Exception as e:
         return {'error': str(e)}
@@ -5281,6 +6007,7 @@ def set_viewport_crop(p):
 # ── Worksheets ──────────────────────────────────────────────────────────────
 
 def get_worksheets(p):
+    """List all worksheets in the document."""
     hs = _collect('T=WORKSHEET')
     return {'worksheets': [{'object_id': _oid(h),
                             'name': _safe(lambda h=h: vs.GetName(h))}
@@ -5349,211 +6076,115 @@ def export_pdf(p):
     }
 
 def export_dxf(p):
-    """DXF/DWG export on Vectorworks 2026 (macOS).
+    """Export document to DXF/DWG format.
 
-    vs.ExportDXFDWG() opens a modal dialog — not safe for unattended use.
-    vs.ExportDXFDWG_Batch(path) is a batch API that may work headlessly but
-    the success signal is a void return and post-write file existence is the
-    only verification path.  This function uses the batch form when a path is
-    supplied and verifies the output file was written.
-
-    params: {path (required for headless — must be absolute .dxf or .dwg)}
+    NOT IMPLEMENTABLE on VW2026: the only export API found, vs.ExportDXFDWG,
+    takes no path/format arguments and opens the interactive export dialog
+    (blocks the bridge on user input) — forbidden by house rule 3. There is
+    no scriptable, non-modal DXF/DWG export in the vs.* surface on this
+    build. Fails honestly rather than pretending to export.
     """
-    path_str = str(p.get('path') or '').strip()
-    if not path_str:
-        return {
-            'error': 'DXF/DWG export requires a path or manual interaction',
-            'code': 'MODAL_DIALOG_REQUIRED',
-            'detail': (
-                'export_dxf without a path opens a modal dialog and cannot '
-                'succeed in an unattended bridge call. Supply an absolute path.'
-            ),
-        }
-    if not os.path.isabs(path_str):
-        return {'error': 'absolute path required for unattended DXF export'}
-    ext = os.path.splitext(path_str)[1].lower()
-    if ext not in ('.dxf', '.dwg'):
-        return {'error': 'export path must end in .dxf or .dwg'}
-    parent = os.path.dirname(path_str)
-    if not os.path.isdir(parent):
-        return {'error': 'export directory does not exist: %s' % parent}
-    before = _safe(lambda: (os.path.getsize(path_str), os.stat(path_str).st_mtime_ns))
-    try:
-        vs.ExportDXFDWG_Batch(path_str)
-    except Exception as exc:
-        return {'error': str(exc)}
-    if not os.path.isfile(path_str):
-        return {
-            'error': 'ExportDXFDWG_Batch returned but no file was written — '
-                     'export settings dialog may have intercepted the call',
-            'path': path_str,
-        }
-    after = (os.path.getsize(path_str), os.stat(path_str).st_mtime_ns)
-    if before is not None and after == before:
-        return {'error': 'DXF/DWG output file was not updated', 'path': path_str}
-    if after[0] <= 0:
-        return {'error': 'DXF/DWG export wrote an empty file', 'path': path_str}
-    return {'status': 'ok', 'path': path_str, 'size': after[0]}
+    return {'error': ('DXF/DWG export is not scriptable on VW2026: the only '
+                       'available function (vs.ExportDXFDWG) opens a modal '
+                       'dialog and takes no path argument. vs.ExportDXFDWG_Batch, '
+                       'which this command used to call, does not exist.')}
 
 def export_image(p):
-    """Headless image export with strict pre- and post-write verification.
+    """Not implementable on VW2026 — fails loudly instead of pretending.
 
-    Fails closed on:
-      - missing / relative path
-      - missing parent directory
-      - unsupported extension
-      - VW engine exception
-      - file not present after the call
-      - file is empty (zero bytes)
+    This used to call vs.ExportImageFile(path, w, h, dpi, fmt). The real VW2026
+    signature is ExportImageFile(hImage, filePath): two arguments, and the
+    handle is an Image OBJECT in the document, not the drawing. The call
+    therefore did nothing, raised nothing, and returned {'status':'ok','path':…}
+    — so callers believed a file had been written and only found out much later
+    that the path was empty. A silent no-op that reports success is worse than
+    no tool at all.
 
-    params: {path (absolute), width(int), height(int), dpi(int),
-             format('png'|'jpg'|'tif')}
+    There is no headless drawing-to-raster API in vs.*; the menu-driven export
+    opens a modal dialog, which the unattended bridge cannot answer.
     """
-    path_str = str(p.get('path') or '').strip()
-    if not path_str:
-        return {'error': 'path is required for export_image'}
-    if not os.path.isabs(path_str):
-        return {'error': 'absolute path required; got: %r' % path_str}
-    ext = os.path.splitext(path_str)[1].lower()
-    fmap = {'png': 4, 'jpg': 2, 'jpeg': 2, 'tif': 3, 'tiff': 3}
-    if ext.lstrip('.') not in fmap:
-        return {'error': 'unsupported image extension %r; use png/jpg/tif' % ext}
-    parent = os.path.dirname(path_str)
-    if not os.path.isdir(parent):
-        return {'error': 'export directory does not exist: %s' % parent}
-    try:
-        w = int(p.get('width', 2000))
-        h_px = int(p.get('height', 1500))
-        dpi = int(p.get('dpi', 150))
-    except (TypeError, ValueError) as exc:
-        return {'error': 'width/height/dpi must be integers: %s' % exc}
-    if w <= 0 or h_px <= 0 or dpi <= 0:
-        return {'error': 'width/height/dpi must be positive integers'}
-    fmt = str(p.get('format', ext.lstrip('.')) or ext.lstrip('.')).lower()
-    canonical = {'jpeg': 'jpg', 'tiff': 'tif'}
-    if canonical.get(fmt, fmt) != canonical.get(ext.lstrip('.'), ext.lstrip('.')):
-        return {'error': 'format does not match output extension'}
-    fmt_code = fmap[fmt]
-    before = _safe(lambda: (os.path.getsize(path_str), os.stat(path_str).st_mtime_ns))
-    try:
-        ok = vs.ExportImageFile(path_str, w, h_px, dpi, fmt_code)
-    except Exception as exc:
-        return {'error': 'ExportImageFile raised: %s' % exc, 'path': path_str}
-    if ok is False:
-        return {'error': 'ExportImageFile returned false', 'path': path_str}
-    if not os.path.isfile(path_str):
-        return {'error': 'ExportImageFile returned but no file was written',
-                'path': path_str}
-    size = os.path.getsize(path_str)
-    if size == 0:
-        return {'error': 'ExportImageFile wrote an empty file', 'path': path_str,
-                'size': size}
-    after = (size, os.stat(path_str).st_mtime_ns)
-    if before is not None and after == before:
-        return {'error': 'image output file was not updated', 'path': path_str}
-    return {'status': 'ok', 'path': path_str, 'width': w, 'height': h_px,
-            'dpi': dpi, 'format': fmt, 'size': size}
-
-def export_stl(p):
-    """Headless STL export with explicit path and post-write verification."""
-    path = str(p.get('path', '') or '').strip()
-    if not path or not os.path.isabs(path):
-        return {'error': 'absolute .stl path required'}
-    if not path.lower().endswith('.stl'):
-        return {'error': 'export path must end in .stl'}
-    parent = os.path.dirname(path)
-    if not os.path.isdir(parent):
-        return {'error': 'export directory does not exist: %s' % parent}
-    try:
-        tess = float(p.get('tessellation', 50.0))
-    except (TypeError, ValueError):
-        return {'error': 'tessellation must be a number from 0 to 100'}
-    if not 0.0 <= tess <= 100.0:
-        return {'error': 'tessellation must be from 0 to 100'}
-    scope = str(p.get('scope', 'selected') or 'selected').lower()
-    options = {'selected': 0, 'active_layer': 1, 'all': 2}
-    if scope not in options:
-        return {'error': 'scope must be selected, active_layer, or all'}
-    if scope == 'selected' and not _collect('SEL=TRUE', 1):
-        return {'error': 'no visible objects selected for STL export'}
-    binary = bool(p.get('binary', True))
-    before = _safe(lambda: (os.path.getsize(path), os.stat(path).st_mtime_ns))
-    try:
-        ok = bool(vs.ExportSTL(path, binary, tess, options[scope]))
-    except Exception as e:
-        return {'error': str(e)}
-    if not ok:
-        return {'error': 'Vectorworks ExportSTL returned false', 'path': path}
-    if not os.path.isfile(path):
-        return {'error': 'Vectorworks reported success but no STL was written',
-                'path': path}
-    after = (os.path.getsize(path), os.stat(path).st_mtime_ns)
-    if before is not None and after == before:
-        return {'error': 'STL output file was not updated', 'path': path}
-    if after[0] <= 0:
-        return {'error': 'STL export wrote an empty file', 'path': path}
-    return {'status': 'ok', 'path': path, 'size': after[0],
-            'binary': binary, 'tessellation': tess, 'scope': scope}
+    path = p.get('path', '')
+    hint = p.get('object_id')
+    if hint:
+        # Exporting an actual Image object IS supported — that is what the API
+        # is for. Honour it when the caller passes one.
+        try:
+            h = _h(hint)
+            if h is None:
+                return {'error': 'object not found: %s' % hint}
+            vs.ExportImageFile(h, path)
+            return {'status': 'ok', 'path': path, 'exported': 'image object'}
+        except Exception as e:
+            return {'error': str(e)}
+    return {'error':
+            "export_image cannot rasterize the drawing on VW2026: "
+            "vs.ExportImageFile(hImage, filePath) exports an Image OBJECT, not "
+            "the document, and no headless render-to-file API exists. "
+            "To SEE the drawing use the `screenshot` tool (captures the "
+            "Vectorworks window and returns the picture directly). "
+            "For a vector deliverable use `export_pdf`. To export an existing "
+            "Image object, pass its object_id to this command.",
+            'path': path}
 
 def import_dwg(p):
-    """DWG/DXF import requires a modal dialog on Vectorworks 2026 (macOS).
+    """Import a DXF/DWG file. params: {path, layer (optional target layer)}.
 
-    vs.ImportDXFDWG raises a modal import-settings sheet with no suppression
-    flag that works reliably in the bridge environment.  This function refuses
-    by default to prevent false 'status: ok' returns that hide the dialog.
-
-    params: {path} — present for schema compat; not used.
+    layer used to be accepted by the server and dropped here, so an import
+    aimed at a specific layer landed on whatever was active and still reported
+    ok. _with_layer_class/_restore is the same pattern the draw_* commands use.
     """
-    return {
-        'error': 'DWG/DXF import requires manual interaction',
-        'code': 'MODAL_DIALOG_REQUIRED',
-        'detail': (
-            'import_dwg opens a modal import-settings dialog on Vectorworks 2026 '
-            '(macOS) and cannot succeed in an unattended bridge call. '
-            'Import DWG/DXF manually via File → Import → Import DXF/DWG.'
-        ),
-    }
-
-def export_shp(p):
-    """Shapefile export on Vectorworks 2026 (macOS).
-
-    vs.ExportSHP opens a modal export dialog on macOS; there is no proven
-    headless API path.  This function refuses by default.
-
-    params: {path} — present for schema compat; not used.
-    """
-    return {
-        'error': 'Shapefile export requires manual interaction',
-        'code': 'MODAL_DIALOG_REQUIRED',
-        'detail': (
-            'export_shp opens a modal export dialog on Vectorworks 2026 (macOS) '
-            'and cannot succeed in an unattended bridge call. '
-            'Export Shapefile manually via File → Export → Export Shapefile.'
-        ),
-    }
-
-def import_image(p):
+    path = p.get('path', '')
+    if not path: return {'error': 'path required'}
+    prev = _with_layer_class(p)
     try:
-        path = p.get('path', '')
-        x, y = p.get('x', 0), p.get('y', 0)
-        vs.ImportImageFile(path, (x, y))
-        return {'status': 'ok', 'object_id': _oid(vs.LNewObj())}
+        vs.ImportDXFDWG(path, False)
+        return {'status': 'ok', 'path': path,
+                'layer': _safe(lambda: vs.GetLName(vs.ActLayer()))}
     except Exception as e:
         return {'error': str(e)}
+    finally:
+        _restore(prev)
+
+def export_shp(p):
+    """Export to Shapefile (GIS export).
+
+    NOT IMPLEMENTABLE on VW2026: vs.ExportSHP does not exist, and the only
+    related function, vs.LegacyShapefileExp, opens the old shapefile-export
+    UI and blocks on user input — forbidden by house rule 3. Fails honestly
+    rather than pretending to export.
+    """
+    return {'error': ('SHP export is not scriptable on VW2026: vs.ExportSHP '
+                       'does not exist, and the only related function '
+                       '(vs.LegacyShapefileExp) opens a modal dialog.')}
+
+def import_image(p):
+    """Import an image file as an image object. params: {path, x, y, layer}.
+
+    layer used to be accepted by the server and dropped here — see import_dwg.
+    """
+    path = p.get('path', '')
+    if not path: return {'error': 'path required'}
+    prev = _with_layer_class(p)
+    try:
+        vs.ImportImageFile(path, (p.get('x', 0), p.get('y', 0)))
+        return {'status': 'ok', 'object_id': _oid(vs.LNewObj()),
+                'layer': _safe(lambda: vs.GetLName(vs.ActLayer()))}
+    except Exception as e:
+        return {'error': str(e)}
+    finally:
+        _restore(prev)
 
 
 # ── View ────────────────────────────────────────────────────────────────────
 
 def zoom_to_fit(p):
+    """Zoom to fit all objects in view."""
     try:
-        vs.FitViewToObjects()
-    except AttributeError:
-        # VW2026: FitViewToObjects removed; fall back to menu command
-        try:
-            vs.DoMenuTextByName('Fit To Objects', 0)
-        except Exception as e:
-            return {'error': str(e)}
-    return {'status': 'ok'}
+        vs.DoMenuTextByName('Fit To Objects', 0)
+        _safe(lambda: vs.ReDrawAll())
+        return {'status': 'ok'}
+    except Exception as e:
+        return {'error': str(e)}
 
 def zoom_to_selection(p):
     # VW2026: no ZoomToSel. Drive the 'Fit To Objects' menu command, which
@@ -5577,9 +6208,16 @@ def refresh_view(p):
 # ── GIS ─────────────────────────────────────────────────────────────────────
 
 def set_georeferencing(p):
+    """Set document georeferencing CRS (e.g. EPSG:25832) using the current
+    user origin (same vs.SetDocGeoRefByUsrOrg call as set_document_georef)."""
+    crs = p.get('crs') or p.get('epsg') or 'EPSG:25832'
     try:
-        vs.SetDocumentGeoreferenceEPSG(p.get('crs', 'EPSG:25832'))
-        return {'status': 'ok'}
+        epsg = int(str(crs).upper().replace('EPSG:', '').strip())
+    except (TypeError, ValueError):
+        return {'error': f'Invalid EPSG code: {crs!r}'}
+    try:
+        vs.SetDocGeoRefByUsrOrg(epsg)
+        return {'status': 'ok', 'epsg': epsg}
     except Exception as e:
         return {'error': str(e)}
 
@@ -5788,12 +6426,33 @@ def for_each_criteria(p):
 
 # ── Baumkataster Bulk Record Setter ──────────────────────────────────────────
 
+# Fields that vs.ResetObject wipes on the VW2026 Existing-Tree PIO (the regen
+# re-runs auto-numbering and clears them). They are written AFTER the reset,
+# and no further reset must follow — the LLA batch tools document the same.
+_PIO_LATE_FIELDS = ('Tree No', 'Instance Name')
+
+
+def _pio_record_name(h, requested=None):
+    """Record to write: the caller's choice, else the PIO's own parametric
+    record (German VW2026 names it 'Existing Tree', not 'Baumkataster')."""
+    if requested:
+        return requested
+    rec = _safe(lambda: vs.GetParametricRecord(h))
+    nm = _safe(lambda: vs.GetName(rec)) if rec else None
+    return nm or 'Baumkataster'
+
+
 def baumkataster_set_fields(p):
-    """Bulk-set record fields. fields: {FieldName: value}. Default record: Baumkataster."""
+    """Bulk-set record fields. fields: {FieldName: value}.
+
+    record: defaults to the object's parametric record. reset: ResetObject
+    after writing (default True). 'Tree No' / 'Instance Name' are always
+    written after the reset because VW2026 clears them on regen."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
-    rec = p.get('record', 'Baumkataster')
-    fields = p.get('fields', {}) or {}
+    rec = _pio_record_name(h, p.get('record'))
+    fields = dict(p.get('fields', {}) or {})
+    late = {k: fields.pop(k) for k in list(fields) if k in _PIO_LATE_FIELDS}
     # Attach if not already attached
     try:
         vs.SetRecord(h, rec)
@@ -5805,9 +6464,17 @@ def baumkataster_set_fields(p):
             done += 1
         except Exception as e:
             errs[k] = str(e)
-    try: vs.ResetObject(h)
-    except Exception: pass
-    return {'status': 'ok', 'set': done, 'errors': errs}
+    if p.get('reset', True):
+        try: vs.ResetObject(h)
+        except Exception: pass
+    for k, v in late.items():
+        try:
+            vs.SetRField(h, rec, k, str(v))
+            done += 1
+        except Exception as e:
+            errs[k] = str(e)
+    return {'status': 'ok', 'set': done, 'errors': errs, 'record': rec,
+            'late_fields': sorted(late)}
 
 
 # ── Extra 2D Primitives ──────────────────────────────────────────────────────
@@ -5870,11 +6537,16 @@ def _layer_uuids():
 
 def _apply_pio_params(h, name, parameters):
     if not parameters: return
-    for field, value in parameters.items():
+    params = dict(parameters)
+    late = {k: params.pop(k) for k in list(params) if k in _PIO_LATE_FIELDS}
+    for field, value in params.items():
         try: vs.SetRField(h, name, field, str(value))
         except Exception: pass
     try: vs.ResetObject(h)
     except Exception: pass
+    for field, value in late.items():          # see _PIO_LATE_FIELDS
+        try: vs.SetRField(h, name, field, str(value))
+        except Exception: pass
 
 def create_pio(p):
     """Create a Plug-in Object (Door, Window, Stair, Fence, Hardscape, Data Tag, …).
@@ -5935,6 +6607,534 @@ def create_pio_from_path(p):
         return {'status': 'ok', 'object_id': _oid(new_h)}
     finally:
         _restore(prev)
+
+
+# ── Gelände: Gefälle-Grundriss (Grade CW) und Höhenpunkte (Stake Object) ────
+# Feldnamen am 10.10.2026 an handgesetzten Objekten (VW2026 DE) ausgelesen.
+# „Höhe Punkt 1/2" heißen intern ohne Umlaut („Hhe Punkt 1"), Werte stehen mit
+# deutschem Dezimalkomma im Record. Grade CW ist ein Pfad-PIO mit 2 Punkten;
+# Einfügepunkt = Punkt 1, Pfad lokal. Endpunkte, die sich treffen, verbindet
+# VW selbst zu einem Gefällenetz.
+
+_GRADE = 'Grade CW'
+_STAKE = 'Stake Object'
+
+
+def _fld(h, rec, *needles):
+    """Feldname im Parametric Record über Teilstrings finden (robust gegen
+    Umlaut-Verlust in internen Namen)."""
+    r = vs.GetParametricRecord(h)
+    for i in range(1, vs.NumFields(r) + 1):
+        n = vs.GetFldName(r, i)
+        if all(s in n for s in needles):
+            return n
+    return None
+
+
+def _num(v):
+    return ('%.12g' % float(v)).replace('.', ',')
+
+
+def _crit_uuids(crit):
+    s = set()
+    vs.ForEachObject(lambda o: s.add(vs.GetObjectUuid(o)), crit)
+    return s
+
+
+def _new_on_layer(layer, pio, before):
+    crit = "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), pio)
+    new = [u for u in _crit_uuids(crit) if u not in before]
+    return new[0] if len(new) == 1 else None
+
+
+def _grade_template(opts, layer):
+    """Vorlage-Grade finden: params template (UUID) oder erstes Grade CW auf
+    der Zielebene. Per CreateCustomObjectPath erzeugte Grades bleiben
+    uninitialisiert (ControlPoints 0, Pfeil als Stummel bei −10/−10, Länge 0,
+    kein Symbol) — nur ein mit dem Werkzeug gesetztes Grade zeichnet richtig."""
+    if opts.get('template'):
+        return _h(opts['template'])
+    found = []
+    vs.ForEachObject(lambda o: found.append(o) if not found else None,
+                     "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), _GRADE))
+    return found[0] if found else None
+
+
+_GRADE_PENDING = 'grade_tag_pending'
+
+
+def _grade_pending_get():
+    try:
+        return json.loads(vs.GetSavedSetting('vwxmcp', _GRADE_PENDING)[1] or '[]')
+    except Exception:
+        return []
+
+
+def _grade_pending_add(layer, stale, target):
+    lst = _grade_pending_get()
+    lst.append({'doc': vs.GetFName(), 'layer': layer, 'stale': list(stale), 'target': list(target)})
+    vs.SetSavedSetting('vwxmcp', _GRADE_PENDING, json.dumps(lst))
+
+
+def _grade_finish_pending():
+    """Vorgemerkte Endpunkt-Stempel verschieben (nur im selben Dokument)."""
+    lst, rest, moved = _grade_pending_get(), [], 0
+    doc = vs.GetFName()
+    for e in lst:
+        if e['doc'] != doc:
+            rest.append(e); continue
+        tags = []
+        vs.ForEachObject(lambda o: tags.append(o),
+                         "(L='%s') & (PON='Data Tag')" % e['layer'].replace("'", "''"))
+        sx, sy = e['stale']
+        best, bd = None, 0.6 ** 2   # Stempelmitte liegt ~0,35 m neben dem Punkt
+        for t in tags:
+            c = vs.HCenter(t); d = (c[0] - sx) ** 2 + (c[1] - sy) ** 2
+            if d < bd: best, bd = t, d
+        if best is None:
+            rest.append(e); continue
+        vs.HMove(best, e['target'][0] - sx, e['target'][1] - sy)
+        vs.ResetObject(best)
+        moved += 1
+        # Gefällenetz: an gemeinsamen Ecken liegen jetzt zwei gleiche Stempel
+        c0 = vs.HCenter(best)
+        for t in tags:
+            if t != best and vs.GetTypeN(t) != 0:
+                c = vs.HCenter(t)
+                if abs(c[0] - c0[0]) < 0.01 and abs(c[1] - c0[1]) < 0.01:
+                    vs.DelObject(best); break
+    vs.SetSavedSetting('vwxmcp', _GRADE_PENDING, json.dumps(rest))
+    return moved, len(rest)
+
+
+def grade_finish(p=None):
+    """Nach create_grade / convert_3dpoly_to_grades aufrufen (eigener Aufruf):
+    setzt die mitkopierten Höhenstempel an die neuen Endpunkte."""
+    moved, left = _grade_finish_pending()
+    return {'status': 'ok', 'moved': moved, 'pending': left}
+
+
+def _grade_shape(h, wx, wy, rz, z1, z2):
+    """Pfad, ControlPoints, Höhen und Neigungsfelder eines Grade CW setzen.
+    (wx, wy) = Vektor Punkt 1 → Punkt 2 im Rahmen des Containers; rz = Drehung
+    des Grade-Objekts darin. Pfad/ControlPoints sind objekt-lokal (Ursprung = Punkt 1)."""
+    a = math.radians(-rz)
+    dx = wx * math.cos(a) - wy * math.sin(a)
+    dy = wx * math.sin(a) + wy * math.cos(a)
+    # Der Pfad wird ROH gespeichert: roh = lokal − GetOrigin() (im Lageplan
+    # beginnt der Pfad eines Grades bei 2047217/6626760 = −Ursprung). Ohne die
+    # Korrektur liegt Punkt 1 um den Ursprungsversatz daneben — bei Ursprung 0
+    # unsichtbar, im georeferenzierten Plan Kilometer weit (verifiziert 10.10.).
+    O = vs.GetOrigin()
+    vs.BeginPoly(); vs.AddPoint(-O[0], -O[1]); vs.AddPoint(dx - O[0], dy - O[1]); vs.EndPoly()
+    poly = vs.LNewObj()
+    pl = vs.ConvertToPolyline(poly, False)
+    vs.DelObject(poly)
+    vs.SetCustomObjectPath(h, pl)
+    def cp(i, x, y):
+        vs.SetRField(h, _GRADE, 'ControlPoint0%dX' % i, _num(x))
+        vs.SetRField(h, _GRADE, 'ControlPoint0%dY' % i, _num(y))
+    # Versätze wie vom Werkzeug: Höhentexte −0,075/+0,1775, Neigungstext Mitte +0,075/+0,1795
+    cp(1, 0, 0); cp(2, dx, dy)
+    cp(3, -0.075, 0.1775); cp(4, dx - 0.075, dy + 0.1775)
+    mx, my = dx / 2 + 0.075, dy / 2 + 0.1795
+    cp(5, mx, my); cp(6, mx, my - 0.05); cp(7, mx, my - 0.10)
+    vs.SetRField(h, _GRADE, 'Known Param 1', 'Elevation 1')
+    vs.SetRField(h, _GRADE, 'Known Param 2', 'Elevation 2')
+    vs.SetRField(h, _GRADE, _fld(h, _GRADE, 'he Punkt 1'), _num(z1))
+    vs.SetRField(h, _GRADE, _fld(h, _GRADE, 'he Punkt 2'), _num(z2))
+    # Neigungsfelder aus der Vorlage überschreiben (Berichte/Arbeitsblätter)
+    ln = math.hypot(wx, wy)
+    pc = abs(z2 - z1) / ln * 100 if ln else 0
+    up, dn = ('%.3f' % pc if z2 > z1 else '0'), ('%.3f' % pc if z2 < z1 else '0')
+    for f, v in (('Neigung in % steigend', up), ('Upgrade pc', up),
+                 ('Neigung in % fallend', dn), ('Downgrade pc', dn)):
+        vs.SetRField(h, _GRADE, f, v.replace('.', ','))
+
+
+def _grade_one(x1, y1, z1, x2, y2, z2, opts):
+    layer = vs.GetLName(vs.ActLayer())
+    src = _grade_template(opts, layer)
+    if not src:
+        return {'error': 'Keine Vorlage: bitte ein Gefälle-Grundriss mit dem Werkzeug auf '
+                         'Ebene „%s" setzen (oder template=<UUID>)' % layer}
+    sp = vs.GetCustomObjectPath(src)
+    s_end = vs.GetPolyPt(sp, vs.GetVertNum(sp))
+    O = vs.GetOrigin()
+    s_end = (s_end[0] + O[0], s_end[1] + O[1])     # Pfad roh → lokal
+    ok, s_off, _, _, s_rz = vs.GetEntityMatrix(src)
+    h = vs.HDuplicate(src, 0, 0)
+    if vs.GetLayer(h) != vs.ActLayer():
+        vs.SetParent(h, vs.ActLayer())
+    vs.HMove(h, x1 - s_off[0], y1 - s_off[1])
+    # Werkzeug legt das Objekt auf z = Mittel der Endhöhen
+    vs.Move3DObj(h, 0, 0, (z1 + z2) / 2 - s_off[2])
+    _grade_shape(h, x2 - x1, y2 - y1, s_rz, z1, z2)
+    # Mitkopierte Höhenstempel (Data Tag) entstehen erst NACH Skriptende und
+    # bleiben am alten Endpunkt-Versatz stehen → vormerken, grade_finish verschiebt
+    ca, sa = math.cos(math.radians(s_rz)), math.sin(math.radians(s_rz))
+    old_end = (x1 + s_end[0] * ca - s_end[1] * sa, y1 + s_end[0] * sa + s_end[1] * ca)
+    _grade_pending_add(layer, old_end, (x2, y2))
+    u = vs.GetObjectUuid(h)
+    f1 = _fld(h, _GRADE, 'he Punkt 1'); f2 = _fld(h, _GRADE, 'he Punkt 2')
+    vs.SetRField(h, _GRADE, f1, _num(z1))
+    vs.SetRField(h, _GRADE, f2, _num(z2))
+    if opts.get('modifier', True):
+        vs.SetRField(h, _GRADE, 'Einstellungen', 'Als Modifikator verwenden')
+    vs.SetRField(h, _GRADE, 'Model Type', opts.get('model', 'Proposed'))
+    vs.SetRField(h, _GRADE, _fld(h, _GRADE, 'Neigung beschriften'), 'True' if opts.get('label_slope', True) else 'False')
+    lh = _fld(h, _GRADE, 'hen beschriften')
+    if lh:
+        vs.SetRField(h, _GRADE, lh, 'True' if opts.get('label_heights', False) else 'False')
+    vs.ResetObject(h)
+    ln = math.hypot(x2 - x1, y2 - y1)
+    # Längen-/Neigungsfelder rechnet das PIO erst beim nächsten Reset nach
+    return {'object_id': u, 'z1': vs.GetRField(h, _GRADE, f1), 'z2': vs.GetRField(h, _GRADE, f2),
+            'length': round(ln, 4), 'slope_pc': round((z2 - z1) / ln * 100, 3) if ln else None}
+
+
+def create_grade(p):
+    """Gefälle-Grundriss (Grade CW) zwischen zwei Punkten anlegen.
+    Braucht eine Vorlage: ein mit dem Werkzeug gesetztes Grade auf der
+    Zielebene (oder template=<UUID>) — es wird dupliziert und umgesetzt.
+    params: x1,y1,z1,x2,y2,z2 (Dokumentkoordinaten wie Lineal), layer, class,
+    modifier (True = „Als Modifikator verwenden"), model ('Proposed'/'Existing'),
+    label_slope (True), label_heights (False), template (UUID).
+    Danach grade_finish in EIGENEM Aufruf (Höhenstempel ans Ende setzen)."""
+    _grade_finish_pending()
+    prev = _with_layer_class(p)
+    try:
+        r = _grade_one(float(p['x1']), float(p['y1']), float(p['z1']),
+                       float(p['x2']), float(p['y2']), float(p['z2']), p)
+        if 'error' in r: return r
+        r['status'] = 'ok'
+        return r
+    except KeyError as e:
+        return {'error': 'Parameter fehlt: %s' % e}
+    finally:
+        _restore(prev)
+
+
+def create_stake(p):
+    """Höhenpunkt (Stake Object) setzen. params: x,y,z, layer, class,
+    mode ('modifier' = Geländemodifikator, 'data' = Geländemodelldaten,
+    '2d' = nur Darstellung), model ('Proposed'/'Existing')."""
+    prev = _with_layer_class(p)
+    try:
+        layer = vs.GetLName(vs.ActLayer())
+        crit = "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), _STAKE)
+        before = _crit_uuids(crit)
+        vs.CreateCustomObjectN(_STAKE, (float(p['x']), float(p['y'])), 0, False)
+        u = _new_on_layer(layer, _STAKE, before)
+        if not u:
+            return {'error': 'Stake nicht eindeutig gefunden'}
+        h = vs.GetObjectByUuid(u)
+        mode = {'modifier': 'Site modifier object', 'data': 'Site model data',
+                '2d': '2D/3D graphics only'}.get(p.get('mode', 'modifier'), p.get('mode'))
+        vs.SetRField(h, _STAKE, 'Mode', mode)
+        vs.SetRField(h, _STAKE, 'Site Model', p.get('model', 'Proposed'))
+        # Höhe = 3D-Lage des Objekts; Reset schreibt Z Value daraus zurück
+        ok, off, _, _, _ = vs.GetEntityMatrix(h)
+        vs.Move3DObj(h, 0, 0, float(p['z']) - off[2])
+        vs.SetRField(h, _STAKE, 'Z Value', _num(p['z']))
+        vs.ResetObject(h)
+        return {'status': 'ok', 'object_id': u, 'mode': vs.GetRField(h, _STAKE, 'Mode'),
+                'site_model': vs.GetRField(h, _STAKE, 'Site Model'), 'z': vs.GetRField(h, _STAKE, 'Z Value')}
+    except KeyError as e:
+        return {'error': 'Parameter fehlt: %s' % e}
+    finally:
+        _restore(prev)
+
+
+def convert_3dpoly_to_grades(p):
+    """3D-Polygon (GM-Modifikator) in Gefälle-Grundriss umwandeln: je Kante ein
+    Grade CW mit den z-Werten der Eckpunkte. params: object_id (3D-Polygon),
+    layer/class für die Grades (Default: Ebene des Polygons), closed (auto),
+    min_length (0.05 m; kürzere Kanten überspringen), skip_flat (False:
+    Kanten ohne Höhenunterschied trotzdem anlegen), modifier, label_slope,
+    label_heights, template. Das Polygon selbst bleibt unverändert.
+    Danach grade_finish in EIGENEM Aufruf (Höhenstempel ans Ende setzen)."""
+    _grade_finish_pending()
+    src = _h(p.get('object_id'))
+    if not src: return {'error': 'Objekt nicht gefunden'}
+    if vs.GetTypeN(src) != 25: return {'error': 'kein 3D-Polygon (Typ %d)' % vs.GetTypeN(src)}
+    belag = _h(p['hardscape']) if p.get('hardscape') else None
+    if p.get('hardscape') and not belag:
+        return {'error': 'Belag nicht gefunden'}
+    q = dict(p)
+    q.setdefault('layer', vs.GetLName(vs.GetLayer(src)))
+    prev = _with_layer_class(q)
+    try:
+        pts = []
+        for i in range(vs.GetVertNum(src)):   # GetPolyPt3D ist 0-basiert
+            x, y, z = vs.GetPolyPt3D(src, i)
+            if abs(x) < 1e9 and abs(z) < 1e9: pts.append((x, y, z))
+        closed = p.get('closed')
+        if closed is None:
+            closed = _safe(lambda: vs.GetPolyClosed(src)) if hasattr(vs, 'GetPolyClosed') else False
+            if not closed and len(pts) > 2:
+                closed = abs(pts[0][0] - pts[-1][0]) < 1e-6 and abs(pts[0][1] - pts[-1][1]) < 1e-6
+        segs = list(zip(pts, pts[1:]))
+        if closed and len(pts) > 2 and (pts[0][:2] != pts[-1][:2]):
+            segs.append((pts[-1], pts[0]))
+        minl = float(p.get('min_length', 0.05))
+        made, skipped = [], 0
+        for a, b in segs:
+            ln = ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5
+            if ln < minl or (p.get('skip_flat') and abs(b[2] - a[2]) < 1e-4):
+                skipped += 1; continue
+            if belag:
+                r = _belag_grade(belag, a[0], a[1], a[2], b[0], b[1], b[2], q)
+            else:
+                r = _grade_one(a[0], a[1], a[2], b[0], b[1], b[2], q)
+            if 'error' in r: return {'error': r['error'], 'made': made}
+            made.append(r['object_id'])
+        if belag:
+            _belag_refit(belag)
+        return {'status': 'ok', 'grades': made, 'count': len(made), 'skipped': skipped,
+                'in_belag': bool(belag)}
+    finally:
+        _restore(prev)
+
+
+# ── Belag (Hardscape): Oberflächenmodifikatoren ─────────────────────────────
+# Am 10.10.2026 in VW2026 verifiziert. Ein „angepasster" Belag (Config =
+# Aligned, Mode 3D = 7, Site Model Interaction = ActAsBoth)
+# trägt seine Oberflächenmodifikatoren (Grade CW / Stake Object) in seiner
+# ERSTEN Untergruppe. Diese Gruppe legt VW erst an, wenn man einmal
+# „Oberflächenmodifikatoren bearbeiten" betritt (Kontextmenü; Server-Werkzeug
+# hardscape_open_modifiers). Selbst gebaute Gruppen oder lose Kinder verwirft
+# der nächste Reset. In die bestehende Gruppe kopierte Grades
+# (CreateDuplicateObject) bleiben und formen die Oberfläche OHNE Geländemodell.
+# Koordinaten innen sind belag-lokal, im Rahmen von Pfad und Mesh:
+#     v = R(−rz_belag) · (Welt − Versatz_belag) − GetOrigin()
+# z: Oberfläche = „Höhe Punkt" + z-Lage des Grade-Objekts → Höhen absolut
+# eintragen, Objekt auf z = 0 (sonst doppelt: 60,12 statt 30,12).
+
+_HARDSCAPE = 'Hardscape'
+_BELAG_ANGEPASST = '7'
+
+
+def _children(h):
+    out = []
+    c = vs.FInGroup(h)
+    while c and vs.GetTypeN(c) != 0:
+        out.append(c)
+        c = vs.NextObj(c)
+    return out
+
+
+def _belag_container(h):
+    """Modifikatoren-Gruppe des Belags oder None. Ein Belag ohne Modifikatoren
+    hat genau eine Untergruppe (Konturpolylinie); mit Modifikatoren steht davor
+    eine weitere Gruppe aus Plug-in-Objekten (Grades, Stakes, Datenstempel)."""
+    groups = [c for c in _children(h) if vs.GetTypeN(c) == 11]
+    if len(groups) < 2:
+        return None
+    first = groups[0]
+    kinds = {vs.GetTypeN(k) for k in _children(first)}
+    if kinds and kinds != {86}:
+        return None
+    return first
+
+
+def _belag_local(h, x, y):
+    """Weltpunkt → belag-lokaler Rahmen der Modifikatoren."""
+    ok, off, _, _, rz = vs.GetEntityMatrix(h)
+    O = vs.GetOrigin()
+    a = math.radians(-rz)
+    dx, dy = x - off[0], y - off[1]
+    return (dx * math.cos(a) - dy * math.sin(a) - O[0],
+            dx * math.sin(a) + dy * math.cos(a) - O[1])
+
+
+def _belag_angepasst(h):
+    return (vs.GetRField(h, _HARDSCAPE, 'Config') == 'Aligned'
+            and vs.GetRField(h, _HARDSCAPE, 'Mode 3D') == _BELAG_ANGEPASST)
+
+
+def _belag_refit(h):
+    vs.SetRField(h, _HARDSCAPE, '__RecreateAlignedTIN', 'True')
+    vs.ResetObject(h)
+
+
+def _belag_grade(h, x1, y1, z1, x2, y2, z2, opts):
+    cont = _belag_container(h)
+    if not cont:
+        return {'error': 'Belag hat noch keine Modifikatoren-Gruppe — einmal '
+                         'hardscape_open_modifiers (Server-Werkzeug) ausführen'}
+    src = _h(opts['template']) if opts.get('template') else None
+    if not src:
+        inner = [k for k in _children(cont) if vs.GetTypeN(k) == 86
+                 and vs.GetName(vs.GetParametricRecord(k)) == _GRADE]
+        src = inner[0] if inner else _grade_template(opts, vs.GetLName(vs.GetLayer(h)))
+    if not src:
+        return {'error': 'Keine Grade-Vorlage: template=<UUID> eines Gefälle-Grundrisses angeben'}
+    vorher = {vs.GetObjectUuid(k) for k in _children(cont)}
+    g = vs.CreateDuplicateObject(src, cont)
+    if not g:
+        return {'error': 'Grade konnte nicht in den Belag kopiert werden'}
+    # Die Höhenstempel der Vorlage reisen mit, behalten aber deren Lage — weit
+    # außerhalb des Belags (Bbox und „Zoom auf Objekte" laufen dann ins Leere)
+    for k in _children(cont):
+        if vs.GetObjectUuid(k) not in vorher and k != g and vs.GetTypeN(k) == 86 \
+                and vs.GetName(vs.GetParametricRecord(k)) == 'Data Tag':
+            vs.DelObject(k)
+    ok, g_off, _, _, g_rz = vs.GetEntityMatrix(g)
+    v1 = _belag_local(h, x1, y1)
+    v2 = _belag_local(h, x2, y2)
+    vs.HMove(g, v1[0] - g_off[0], v1[1] - g_off[1])
+    vs.Move3DObj(g, 0, 0, -g_off[2])
+    _grade_shape(g, v2[0] - v1[0], v2[1] - v1[1], g_rz, z1, z2)
+    vs.SetRField(g, _GRADE, 'Einstellungen', 'Eigene Hoehen')
+    vs.SetRField(g, _GRADE, 'Grade Mode Static', 'Eigene Höhen')
+    vs.ResetObject(g)
+    ln = math.hypot(x2 - x1, y2 - y1)
+    return {'object_id': vs.GetObjectUuid(g), 'local': [list(v1), list(v2)],
+            'slope_pc': round((z2 - z1) / ln * 100, 3) if ln else None}
+
+
+def hardscape_modifier_info(p):
+    """Zustand eines Belags für Oberflächenmodifikatoren. params: object_id.
+    Liefert angepasst (Mode 3D = 7), ob die Modifikatoren-Gruppe existiert und
+    welche Modifikatoren darin liegen (Grade: Weltkoordinaten der Endpunkte)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    cont = _belag_container(h)
+    mods = []
+    if cont:
+        ok, off, _, _, rz = vs.GetEntityMatrix(h)
+        O = vs.GetOrigin(); a = math.radians(rz)
+        def welt(v):
+            lx, ly = v[0] + O[0], v[1] + O[1]
+            return [round(off[0] + lx * math.cos(a) - ly * math.sin(a), 3),
+                    round(off[1] + lx * math.sin(a) + ly * math.cos(a), 3)]
+        for k in _children(cont):
+            n = vs.GetName(vs.GetParametricRecord(k))
+            d = {'pio': n, 'object_id': vs.GetObjectUuid(k)}
+            if n == _GRADE:
+                ok2, go, _, _, grz = vs.GetEntityMatrix(k)
+                pth = vs.GetCustomObjectPath(k)
+                e = vs.GetPolyPt(pth, vs.GetVertNum(pth)) if pth else (-O[0], -O[1])
+                e = (e[0] + O[0], e[1] + O[1])          # Pfad roh → lokal
+                ga = math.radians(grz)
+                end = (go[0] + e[0] * math.cos(ga) - e[1] * math.sin(ga),
+                       go[1] + e[0] * math.sin(ga) + e[1] * math.cos(ga))
+                d.update(p1=welt(go), p2=welt(end),
+                         z1=vs.GetRField(k, _GRADE, _fld(k, _GRADE, 'he Punkt 1')),
+                         z2=vs.GetRField(k, _GRADE, _fld(k, _GRADE, 'he Punkt 2')))
+            mods.append(d)
+    return {'status': 'ok', 'angepasst': _belag_angepasst(h),
+            'container': bool(cont), 'modifikatoren': mods}
+
+
+def hardscape_prepare_modifiers(p):
+    """Belag für hardscape_open_modifiers vorbereiten: auf „Angepasst" stellen
+    (set_aligned, Default True), allein auswählen, Ansicht darauf zoomen.
+    params: object_id, set_aligned."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    if p.get('set_aligned', True) and not _belag_angepasst(h):
+        # „Angepasst" im Dialog setzt drei Felder; Mode 3D allein reicht nicht
+        # (Kontextmenüeintrag fehlt dann, verifiziert 10.10.2026)
+        vs.SetRField(h, _HARDSCAPE, 'Config', 'Aligned')
+        vs.SetRField(h, _HARDSCAPE, 'Mode 3D', _BELAG_ANGEPASST)
+        vs.SetRField(h, _HARDSCAPE, 'Site Model Interaction', 'ActAsBoth')
+        vs.ResetObject(h)
+    # Rechtsklick trifft die Belagfläche nur in der 2D-Planansicht (in 3D-Oben
+    # ist das Innere im Drahtmodell leer → Kontextmenü der Zeichenfläche).
+    # Projektion 6 = 2D-Plan; ein gedrehter Plan bleibt dabei unangetastet.
+    if vs.GetProjection(vs.GetLayer(h)) != 6:
+        _safe(lambda: vs.DoMenuTextByName('Standard Views', 1))
+    vs.DSelectAll()
+    vs.SetSelect(h)
+    _safe(lambda: zoom_to_selection({}))
+    return {'status': 'ok', 'container': bool(_belag_container(h)),
+            'angepasst': _belag_angepasst(h)}
+
+
+def hardscape_add_grade(p):
+    """Gefälle-Grundriss als Oberflächenmodifikator IN einen angepassten Belag
+    legen (wirkt ohne Geländemodell). params: object_id (Belag),
+    x1,y1,z1,x2,y2,z2 in Dokumentkoordinaten wie Lineal/HCenter (werden in den
+    belag-lokalen Rahmen umgerechnet; Höhen absolut), template (Grade-UUID,
+    sonst erstes Grade im Belag bzw. auf seiner Ebene), refit (True: Belag neu
+    berechnen). Voraussetzung: Modifikatoren-Gruppe vorhanden (einmal
+    hardscape_open_modifiers)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    if not _belag_angepasst(h):
+        return {'error': 'Belag ist nicht „Angepasst" — hardscape_prepare_modifiers'}
+    try:
+        r = _belag_grade(h, float(p['x1']), float(p['y1']), float(p['z1']),
+                         float(p['x2']), float(p['y2']), float(p['z2']), p)
+    except KeyError as e:
+        return {'error': 'Parameter fehlt: %s' % e}
+    if 'error' in r: return r
+    if p.get('refit', True):
+        _belag_refit(h)
+    r['status'] = 'ok'
+    return r
+
+
+def _belag_faces(h):
+    """Dreiecke/Vierecke der Belagsoberfläche in Weltkoordinaten. Das Mesh im
+    Belag liegt im Rohrahmen (Welt = Versatz + R(rz)·(v + Ursprung)); eine
+    Kopie wird per MeshToGroup in 3D-Polygone zerlegt und wieder gelöscht.
+    (GetZatXY am Belag trifft nur zufällig — meist 0 —, nicht verwenden.)"""
+    ok, off, _, _, rz = vs.GetEntityMatrix(h)
+    O = vs.GetOrigin(); a = math.radians(rz); ca, sa = math.cos(a), math.sin(a)
+    faces = []
+    for m in [c for c in _children(h) if vs.GetTypeN(c) == 40]:
+        d = vs.CreateDuplicateObject(m, vs.ActLayer())
+        if not d:
+            continue
+        g = vs.MeshToGroup(d) or vs.LNewObj()
+        polys = []
+        def walk(o):
+            c = vs.FInGroup(o)
+            while c and vs.GetTypeN(c) != 0:
+                if vs.GetTypeN(c) == 25: polys.append(c)
+                elif vs.GetTypeN(c) == 11: walk(c)
+                c = vs.NextObj(c)
+        if g and vs.GetTypeN(g) == 11: walk(g)
+        for poly in polys:
+            pts = []
+            for i in range(vs.GetVertNum(poly)):
+                x, y, z = vs.GetPolyPt3D(poly, i)
+                lx, ly = x + O[0], y + O[1]
+                pts.append((off[0] + lx * ca - ly * sa, off[1] + lx * sa + ly * ca, z))
+            if len(pts) >= 3: faces.append(pts)
+        for o in (g, d):
+            if o and vs.GetTypeN(o) != 0: _safe(lambda: vs.DelObject(o))
+    return faces
+
+
+def _z_in_face(f, x, y):
+    """z im (fächertriangulierten) Polygon f, sonst None."""
+    for i in range(1, len(f) - 1):
+        (x1, y1, z1), (x2, y2, z2), (x3, y3, z3) = f[0], f[i], f[i + 1]
+        det = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if abs(det) < 1e-12: continue
+        l1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / det
+        l2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / det
+        l3 = 1 - l1 - l2
+        if min(l1, l2, l3) >= -1e-9:
+            return l1 * z1 + l2 * z2 + l3 * z3
+    return None
+
+
+def hardscape_sample_z(p):
+    """Belagsoberfläche (Oberseite) abtasten. params: object_id, points
+    [[x,y],…] in Dokumentkoordinaten. Rückgabe z je Punkt (None = außerhalb)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    faces = _belag_faces(h)
+    out = []
+    for x, y in p.get('points', []):
+        zs = [z for z in (_z_in_face(f, float(x), float(y)) for f in faces) if z is not None]
+        out.append(round(max(zs), 4) if zs else None)
+    return {'status': 'ok', 'z': out, 'faces': len(faces)}
 
 
 def get_pio_parameters(p):
@@ -6446,7 +7646,8 @@ def offset_polygon(p):
     if not h: return {'error': 'Object not found'}
     dist = float(p.get('distance', 10))
     try:
-        nh = vs.OffsetPoly(h, dist)
+        # OffsetPoly takes seven arguments; OffsetPolyN (Parasolid) takes three.
+        nh = vs.OffsetPolyN(h, dist, bool(p.get('smooth', False)))
         return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
     except Exception as e: return {'error': str(e)}
 
@@ -6494,7 +7695,7 @@ def polygon_centroid(p):
 def polygon_perimeter(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
-    try: return {'perimeter': vs.CalcPolySegLen(h)}
+    try: return {'perimeter': vs.HPerim(h)}   # CalcPolySegLen needs (h, i1, i2)
     except Exception as e: return {'error': str(e)}
 
 def point_in_polygon(p):
@@ -6513,27 +7714,13 @@ def point_along_polygon(p):
         return {'x': x, 'y': y, 'segment': seg}
     except Exception as e: return {'error': str(e)}
 
-def convert_to_polygon(p):
-    h = _h(p.get('object_id'))
-    if not h: return {'error': 'Object not found'}
-    try:
-        nh = vs.ConvertToPolygon(h)
-        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
-    except Exception as e: return {'error': str(e)}
 
-def convert_to_polyline(p):
-    h = _h(p.get('object_id'))
-    if not h: return {'error': 'Object not found'}
-    try:
-        nh = vs.ConvertToPolyline(h)
-        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
-    except Exception as e: return {'error': str(e)}
 
 def convert_to_nurbs(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        nh = vs.ConvertToNURBS(h)
+        nh = vs.ConvertToNURBS(h, bool(p.get('keep_original', False)))
         return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
     except Exception as e: return {'error': str(e)}
 
@@ -6582,8 +7769,8 @@ def get_material_info(p):
         name = vs.GetObjMaterialName(h) if hasattr(vs, 'GetObjMaterialName') else (vs.GetName(mh) if mh else None)
         return {
             'material_name': name,
-            'area':   _safe(lambda: vs.GetMaterialArea(h)),
-            'volume': _safe(lambda: vs.GetMaterialVolume(h)),
+            'area':   _safe(lambda: vs.GetMaterialArea(h, name)) if name else None,
+            'volume': _safe(lambda: vs.GetMaterialVolume(h, name)) if name else None,
             'is_simple': _safe(lambda: vs.IsMaterialSimple(mh)) if mh else None,
         }
     except Exception as e: return {'error': str(e)}
@@ -6887,15 +8074,15 @@ def set_component_texture(p):
 
 # ── Viewport Class / Layer Overrides ─────────────────────────────────────────
 
-def _vp_cl_props(h):
+def _vp_cl_props(vp, cls):
     return {
-        'fill_back':  _safe(lambda: vs.GetVPClOvrdFillBack(h)),
-        'fill_fore':  _safe(lambda: vs.GetVPClOvrdFillFore(h)),
-        'fill_style': _safe(lambda: vs.GetVPClOvrdFillStyle(h)),
-        'pen_back':   _safe(lambda: vs.GetVPClOvrdPenBack(h)),
-        'pen_fore':   _safe(lambda: vs.GetVPClOvrdPenFore(h)),
-        'fill_opacity': _safe(lambda: vs.GetVPClOvrdFillOpty(h)),
-        'pen_opacity':  _safe(lambda: vs.GetVPClOvrdPenOpty(h)),
+        'fill_back':  _safe(lambda: vs.GetVPClOvrdFillBack(vp, cls)),
+        'fill_fore':  _safe(lambda: vs.GetVPClOvrdFillFore(vp, cls)),
+        'fill_style': _safe(lambda: vs.GetVPClOvrdFillStyle(vp, cls)),
+        'pen_back':   _safe(lambda: vs.GetVPClOvrdPenBack(vp, cls)),
+        'pen_fore':   _safe(lambda: vs.GetVPClOvrdPenFore(vp, cls)),
+        'fill_opacity': _safe(lambda: vs.GetVPClOvrdFillOpty(vp, cls)),
+        'pen_opacity':  _safe(lambda: vs.GetVPClOvrdPenOpty(vp, cls)),
     }
 
 def add_vp_class_override(p):
@@ -6941,6 +8128,7 @@ def remove_vp_class_override(p):
     except Exception as e: return {'error': str(e)}
 
 def list_vp_class_overrides(p):
+    """List class overrides on a viewport."""
     vp = _h(p.get('viewport_id'))
     if not vp: return {'error': 'viewport_id required'}
     try:
@@ -6948,12 +8136,11 @@ def list_vp_class_overrides(p):
     except Exception as e:
         return {'error': str(e)}
     out = []
-    # No direct iterator — VW returns handles via a per-index function
     for i in range(1, (n or 0) + 1):
-        oh = _safe(lambda i=i: vs.GetVPClOvrdByIndex(vp, i))
-        if not oh: continue
-        entry = {'index': i, 'class': _safe(lambda: vs.GetVPClOvrdName(oh))}
-        entry.update(_vp_cl_props(oh))
+        cls = _safe(lambda i=i: vs.GetVPClOvrdName(vp, i))
+        if not cls: continue
+        entry = {'index': i, 'class': cls}
+        entry.update(_vp_cl_props(vp, cls))
         out.append(entry)
     return {'count': n, 'overrides': out}
 
@@ -6977,6 +8164,7 @@ def add_vp_layer_override(p):
     except Exception as e: return {'error': str(e)}
 
 def list_vp_layer_overrides(p):
+    """List layer overrides on a viewport."""
     vp = _h(p.get('viewport_id'))
     if not vp: return {'error': 'viewport_id required'}
     try:
@@ -6985,13 +8173,13 @@ def list_vp_layer_overrides(p):
         return {'error': str(e)}
     out = []
     for i in range(1, (n or 0) + 1):
-        oh = _safe(lambda i=i: vs.GetVPLrOvrdByIndex(vp, i))
-        if not oh: continue
+        lh = _safe(lambda i=i: vs.GetVPLrOvrdHandle(vp, i))
+        if not lh: continue
         out.append({
             'index': i,
-            'layer': _safe(lambda: vs.GetVPLrOvrdName(oh)),
-            'fill_fore': _safe(lambda: vs.GetVPLrOvrdFillFore(oh)),
-            'pen_fore':  _safe(lambda: vs.GetVPLrOvrdPenFore(oh)),
+            'layer': _safe(lambda: vs.GetLName(lh)),
+            'fill_fore': _safe(lambda: vs.GetVPLrOvrdFillFore(vp, lh)),
+            'pen_fore':  _safe(lambda: vs.GetVPLrOvrdPenFore(vp, lh)),
         })
     return {'count': n, 'overrides': out}
 
@@ -7036,17 +8224,56 @@ def vs_signature(p):
             else:
                 return {'error': 'no vs function named %r' % name}
         return {'name': name, **s}
-    q = (p.get('search') or '').lower()
+    q = (p.get('search') or '').lower().strip()
     cat = (p.get('category') or '').lower()
+    limit = int(p.get('limit', 25))
+
+    # Ranked, multi-term search. The old version did a single substring test
+    # and then sorted ALPHABETICALLY, so for a query like "area polygon" it
+    # found nothing at all (no function name contains that string), and for
+    # broad queries the best match could sit at position 150 of 200 — which
+    # made the index useless exactly when the caller did not already know the
+    # function name, i.e. the case it exists for.
+    terms = [t for t in re.split(r'[^a-z0-9]+', q) if t]
     res = []
     for k, v in _VS_INDEX.items():
-        if q and q not in k.lower() and q not in v.get('doc', '').lower():
-            continue
         if cat and cat not in v.get('cat', '').lower():
             continue
-        res.append({'name': k, 'args': v['args'], 'cat': v['cat'], 'doc': v['doc'][:80]})
-    res.sort(key=lambda x: x['name'])
-    return {'count': len(res), 'functions': res[:200]}
+        kl = k.lower()
+        doc = v.get('doc', '') or ''
+        docl = doc.lower()
+        if not terms:
+            res.append((0, k, v))
+            continue
+        score = 0
+        matched = 0
+        for t in terms:
+            hit = False
+            if kl == t:
+                score += 100; hit = True
+            elif kl.startswith(t):
+                score += 40; hit = True
+            elif t in kl:
+                score += 25; hit = True
+            if t in docl:
+                score += 6; hit = True
+            if t in (v.get('cat', '') or '').lower():
+                score += 3; hit = True
+            if hit:
+                matched += 1
+        if not matched:
+            continue
+        # Every term matching somewhere beats one term matching strongly.
+        score += 30 * (matched == len(terms))
+        # Prefer the plain name over its N/2/D variants and other long cousins.
+        score -= min(len(k), 40) * 0.2
+        res.append((score, k, v))
+
+    res.sort(key=lambda e: (-e[0], e[1]))
+    out = [{'name': k, 'args': v['args'], 'cat': v['cat'],
+            'doc': (v.get('doc') or '')[:110]}
+           for _s, k, v in res[:limit]]
+    return {'count': len(res), 'returned': len(out), 'functions': out}
 
 def vs_index_stats(p):
     """Summary of the loaded vs.* knowledge index: total functions + per-category
@@ -7140,9 +8367,24 @@ def _batch(p):
 
 # ── Script Execution ────────────────────────────────────────────────────────
 
+# Handle walks (`h = vs.FInGroup(g); while h: ...; h = vs.NextObj(h)`) spin
+# forever on VW2026 — twice on 2026-09-11 that froze Vectorworks completely
+# (one core pegged, memory frozen, only a restart helps). ForEachObject with a
+# criteria string is the safe traversal and descends into groups by itself.
+_HANDLE_WALK = re.compile(r'vs\.(Next|Prev)S?Obj\s*\(')
+
+
 def execute_script(p):
     import io, sys
     code = p.get('code', '')
+    if (_HANDLE_WALK.search(code) and re.search(r'\bwhile\b', code)
+            and not p.get('allow_handle_walk')):
+        return {'output': '', 'result': None, 'error':
+                "refused: a `while` loop over vs.NextObj/PrevObj hangs VW2026 "
+                "indefinitely (needs a Vectorworks restart). Traverse with "
+                "vs.ForEachObject(callback, \"(L='Layer')\") — it descends into "
+                "groups — or symbol instances via \"(S='Name')\". Pass "
+                "allow_handle_walk=true only if you know this build tolerates it."}
     ns = {'vs': vs, '__result__': None}
     buf = io.StringIO()
     old = sys.stdout
@@ -11311,20 +12553,68 @@ def resource_rename(p):
 def resource_delete(p):
     """Delete a resource. WARNING: deleting a Marionette style deletes bound
     instances — set unbind_instances=True (default) to unbind them first.
-    params: name, unbind_instances (bool, default True)."""
+
+    FREEZE RISK: finding which placed objects are bound to this style needs
+    a vs.ForEachObject(cb, "(T=PLUGINOBJECT)") scan. vs.ForEachObject has no
+    early-abort — it walks every object the criteria string can match, no
+    matter how few handles the Python callback keeps, and "(T=PLUGINOBJECT)"
+    alone has no layer filter, so unscoped this is a full-document walk: the
+    exact pattern that has frozen VW for 15+ minutes on a large office file
+    (see house rules / feedback_vwx_no_fulldoc_foreach). unbind_instances
+    defaults to True, so calling this with only {name} used to run that
+    unscoped walk on every single call, silently, including in a loop
+    cleaning up several old styles.
+
+    To bound the cost, pass layer (scan one layer) or layers (scan a list of
+    layers, one ForEachObject call per layer — still bounded, just several
+    smaller walks instead of one unbounded one). Without either, the
+    document-wide scan now requires confirm_full_scan=True to proceed
+    explicitly — it is not refused outright (unlike get_symbol_type's
+    single-instance lookup) because unbinding is a correctness requirement
+    here, not an optional lookup: skipping the scan on layers you didn't
+    list would leave THOSE instances still bound, and vs.DelObject on a
+    style with any remaining bound instance deletes those instances too.
+    A caller that truly needs every layer covered can pass
+    confirm_full_scan=True and accept the one-time full-document cost.
+
+    params: name, unbind_instances (bool, default True), layer (optional,
+    str — scan this one layer), layers (optional, list[str] — scan each of
+    these), confirm_full_scan (bool, default False — required to run the
+    unscoped full-document walk when neither layer nor layers is given)."""
     r = _safe(lambda: vs.GetObject(p.get('name', '')))
     if not r: return {'error': 'resource not found: %s' % p.get('name')}
     unbound = 0
+    scanned_scope = None
     if p.get('unbind_instances', True) and vs.GetTypeN(r) == 16:
-        objs = []
-        def cb(h): objs.append(h)
-        _safe(lambda: vs.ForEachObject(cb, "(T=PLUGINOBJECT)"))
-        for h in objs:
-            if _safe(lambda: vs.GetPluginStyle(h)) == (vs.GetName(r) or ''):
-                _safe(lambda: vs.SetPluginStyle(h, ''))
-                unbound += 1
+        style_name = vs.GetName(r) or ''
+        layer = p.get('layer')
+        layers = p.get('layers') or ([layer] if layer else None)
+        if not layers and not p.get('confirm_full_scan'):
+            return {'error': "unbind_instances needs a bounded scan: pass "
+                              "'layer' (one layer name) or 'layers' (a list) "
+                              "to scope the ForEachObject search, or pass "
+                              "'confirm_full_scan': true to explicitly accept "
+                              "an unscoped document-wide walk (can freeze VW "
+                              "for minutes on a large office file). Nothing "
+                              "was deleted."}
+        scopes = layers if layers else [None]  # [None] = confirmed full scan
+        for scope in scopes:
+            objs = []
+            def cb(h): objs.append(h)
+            if scope:
+                esc = str(scope).replace("'", "''")
+                crit = "(T=PLUGINOBJECT) & (L='%s')" % esc
+            else:
+                crit = "(T=PLUGINOBJECT)"
+            _safe(lambda: vs.ForEachObject(cb, crit))
+            for h in objs:
+                if _safe(lambda: vs.GetPluginStyle(h)) == style_name:
+                    _safe(lambda: vs.SetPluginStyle(h, ''))
+                    unbound += 1
+        scanned_scope = layers if layers else 'full-document (confirmed)'
     vs.DelObject(r)
-    return {'status': 'ok', 'unbound_instances': unbound}
+    return {'status': 'ok', 'unbound_instances': unbound,
+            'scanned_scope': scanned_scope}
 
 def resource_create_folder(p):
     """Try to create a symbol folder by script. UNRELIABLE on VW2026 (see block
@@ -11432,3 +12722,1943 @@ def set_object_style(p):
     if not h: return {'error': 'Object not found'}
     r = vs.SetPluginStyle(h, p.get('style', ''))
     return {'status': 'ok', 'result': str(r), 'style_now': _safe(lambda: vs.GetPluginStyle(h), '')}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein pset-import
+# ──────────────────────────────────────────────────────────────────────────
+
+##############################################################################
+# Baustein 1 -- Pset-DEFINITIONEN importieren und pruefen
+# Ersetzt die bestehende ifc_define_pset (Zeile ~1839) VOLLSTAENDIG durch die
+# Fassung unten; die beiden neuen Funktionen ifc_import_pset_defs und
+# ifc_pset_defined direkt danach einfuegen. os/json sind in commands.py bereits
+# importiert (Zeile 20) -- kein neuer Import noetig.
+##############################################################################
+
+
+
+def ifc_pset_defined(p):
+    """Check whether one or more custom IFC Psets are defined in the document.
+    params: {name: str} for a single pset, or {names: [str, ...]} for several.
+    Wraps IFC_IsPsetDefined (index says BOOLEAN -- trustworthy) and
+    IFC_IsPsetCustom (index leaves 'ret' blank, i.e. its exact return type is
+    NOT confirmed by the index; coerced with bool() here as a best guess -- if
+    it turns out to return something richer than a flag, that nuance is lost).
+    Returns {results: {name: {defined, custom}}}."""
+    names = p.get('names')
+    if not names:
+        n = p.get('name')
+        if not n: return {'error': 'name or names required'}
+        names = [n]
+    results = {}
+    for n in names:
+        results[n] = {
+            'defined': bool(_safe(lambda n=n: vs.IFC_IsPsetDefined(n), False)),
+            'custom':  bool(_safe(lambda n=n: vs.IFC_IsPsetCustom(n), False)),
+        }
+    return {'status': 'ok', 'results': results}
+
+
+def ifc_import_pset_defs(p):
+    """Import Custom Object Pset SCHEMA DEFINITIONS from a file into the
+    document. params: {path, variante: 1|2 (default 1), names: [str, ...]
+    optional}.
+
+    variante 1 -> vs.IFC_DefPsetImport  ("Imports ... from XML, XLSX, CSV or
+                  text files FROM FOLDER" -- per the index doc string, path is
+                  expected to be a FOLDER, VW picks files from it).
+    variante 2 -> vs.IFC_DefPsetImport2 ("... from XML, XLSX, CSV or text
+                  FILE" -- path is one file).
+    This distinction is the literal doc text in vs_index.json, not a guess --
+    but the exact required layout/columns INSIDE that file/folder is not
+    documented anywhere reachable from here (see caller-facing notes below).
+
+    House rule: a schema imported through IFC_DefPsetImport/2 lands in the
+    document as a Record Format (Datensatzformat), NOT as a database table --
+    this is surfaced both here and in the result's 'note' field so a caller
+    does not go looking for it as a worksheet/database.
+
+    Both vs functions return only a bare BOOLEAN -- no list of what was
+    actually defined, no error detail. Trusting that boolean alone is exactly
+    the "stumm False" failure mode the caller warned about, so this checks
+    file existence up front and, when `names` is given, takes an
+    IFC_IsPsetDefined snapshot of exactly those names BEFORE and AFTER calling
+    the import function. The diff (not-defined -> defined) is the only solid
+    evidence available, because there is NO vs.* function in the index that
+    enumerates all pset schemas defined in the document -- searched for
+    'Pset', 'DefPset', 'GetPset': every GetPset*/IFC_GetNumPsets* function
+    takes an hObject (an object instance) and reports the psets ATTACHED to
+    that one object, not the document-wide list of defined schemas. Without a
+    `names` list there is nothing to diff against, and the function says so
+    explicitly in the result instead of pretending the raw boolean is proof."""
+    path = p.get('path')
+    variante = p.get('variante', 1)
+    names = p.get('names') or []
+    if not path:
+        return {'error': 'path required'}
+    if not os.path.isfile(path) and not os.path.isdir(path):
+        return {'error': f'path not found: {path}'}
+    if variante == 2 and os.path.isdir(path):
+        return {'error': 'variante 2 (IFC_DefPsetImport2) expects a single FILE, '
+                          f'but path is a folder: {path}'}
+    if variante == 1 and os.path.isfile(path):
+        # Not necessarily wrong (undocumented whether IFC_DefPsetImport also
+        # accepts a bare file), but this is the one place the doc text and
+        # the caller's input disagree -- flagged rather than silently allowed.
+        pass
+    fn = vs.IFC_DefPsetImport2 if variante == 2 else vs.IFC_DefPsetImport
+
+    def _snapshot():
+        out = {}
+        for n in names:
+            out[n] = {
+                'defined': bool(_safe(lambda n=n: vs.IFC_IsPsetDefined(n), False)),
+                'custom':  bool(_safe(lambda n=n: vs.IFC_IsPsetCustom(n), False)),
+            }
+        return out
+
+    before = _snapshot()
+    ok = bool(_safe(lambda: fn(path), False))
+    after = _snapshot()
+
+    result = {
+        'status': 'ok', 'import_returned': ok, 'variante': variante, 'path': path,
+        'note': 'a schema imported this way lands as a Record Format (Datensatzformat), '
+                'not as a database table',
+    }
+
+    if names:
+        newly_defined = [n for n in names
+                         if not before.get(n, {}).get('defined')
+                         and after.get(n, {}).get('defined')]
+        still_missing = [n for n in names if not after.get(n, {}).get('defined')]
+        result['before'] = before
+        result['after'] = after
+        result['newly_defined'] = newly_defined
+        result['still_missing'] = still_missing
+        if not ok and not newly_defined:
+            result['warning'] = ('import call returned False and none of the given '
+                                  'names became defined -- treat this as a failed import')
+        elif ok and not newly_defined and still_missing:
+            result['warning'] = ('import call returned True but none of the given '
+                                  'names are defined afterward -- likely the names do '
+                                  'not match what is actually inside the file, or the '
+                                  'file/folder shape does not match the variante used '
+                                  '(check the folder-vs-file note above)')
+    else:
+        result['warning'] = ('no `names` given -- there is no vs.* function that lists '
+                              'ALL pset schemas defined in the document, so nothing '
+                              'here can confirm what actually landed beyond the raw '
+                              'boolean; pass `names` with the pset names you expect '
+                              'this file to define to get a real before/after check')
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein datenmanager
+# ──────────────────────────────────────────────────────────────────────────
+
+import vs, os, json
+
+# ---- IFC Data Mapping (IFC_DM*) ------------------------------------------------
+# The office hand-maintains a 9 MB mapping XML (944 object rules, a 40-field
+# custom Pset) via VW's IFC Data Mapping dialog. This section reads and writes
+# that same in-document structure through the 56 IFC_DM* vs.* functions
+# (checked against vwx-plugin/vs_index.json — see header comment on
+# _dm_indexed for the one thing the index does NOT tell us: index base).
+#
+# Shape, everywhere in this section: an object rule is named by a plain string
+# (e.g. "Wall", not a document object handle/UUID) and holds N "entries"; each
+# entry holds direct fields AND/OR named Psets, and each Pset holds its own
+# fields. Every field/pset/entry/object carries Enabled/Optional/Empty state
+# flags and (for objects/psets) a condition formula string.
+
+def _dm_val(r):
+    """Unwrap an IFC_DM 'get value' result. vs_index.json carries NO return
+    type for this family (ret==''). By analogy with IFC_GetPsetProp /
+    IFC_GetEntityProp elsewhere in this file — both confirmed LIVE to return
+    (ok, value[, extra]) tuples — we assume the same shape here, but this has
+    NOT been verified live for IFC_DM* itself. Handles both shapes so a wrong
+    guess degrades gracefully instead of crashing:
+      - (ok, value, ...)  -> value  (index 1, matching the verified pattern)
+      - (value,)          -> value
+      - plain scalar      -> itself
+    """
+    if isinstance(r, (list, tuple)):
+        if len(r) >= 2: return r[1]
+        if len(r) == 1: return r[0]
+        return None
+    return r
+
+def _dm_cnt(r):
+    """Unwrap an IFC_DM 'count' result. Mirrors the dual plain-int /
+    trailing-int-tuple handling already used for IFC_GetNumPsets2 above
+    (`if isinstance(n, (list, tuple)): n = n[-1] ...`) — NOT verified live
+    for IFC_DM* itself, but it is the same 'ret is unknown' situation."""
+    if isinstance(r, (list, tuple)):
+        return int(r[-1]) if r else 0
+    try:
+        return int(r or 0)
+    except Exception:
+        return 0
+
+def _dm_indexed(count, get_one):
+    """Read `count` items via get_one(i), auto-detecting 0- vs 1-based
+    indexing, and say honestly which base was used.
+
+    UNVERIFIED GUESS, spelled out because getting this wrong produces silent
+    garbage, not an engine error: vs_index.json gives no base convention for
+    IFC_DM*. Classic VectorScript 'Nth item' calls elsewhere in this codebase
+    are consistently 1-based (see e.g. ClassNum/GetClName, NumFields/
+    GetFldName — always `range(1, n+1)`). But the ONE IFC_ list getter in
+    this file that has actually been exercised live, IFC_GetPsetInfoAt(h,
+    ball, index), is 0-based (`range(n)`, see ifc_list_psets above). Since
+    IFC_DM* shares the modern 'IFC_' naming/era with IFC_GetPsetInfoAt
+    rather than the classic VS functions, 0-based is tried first here — but
+    this is an analogy, not a fact.
+
+    Returns (pairs, base) where pairs=[(index_used, value), ...] and base is
+    0, 1, or -1 ("ambiguous — neither range came back clean, best guess
+    kept, verify by hand"). Callers propagate `base` into their output under
+    a `*_index_base` key so nobody downstream mistakes a guess for ground
+    truth.
+    """
+    if count <= 0:
+        return [], 0
+
+    def run(rng):
+        return [(i, _dm_val(_safe(lambda i=i: get_one(i)))) for i in rng]
+
+    zero = run(range(count))
+    if all(v not in (None, '') for _, v in zero):
+        return zero, 0
+    one = run(range(1, count + 1))
+    if all(v not in (None, '') for _, v in one):
+        return one, 1
+    zero_holes = sum(1 for _, v in zero if v in (None, ''))
+    one_holes = sum(1 for _, v in one if v in (None, ''))
+    return (one, -1) if one_holes < zero_holes else (zero, -1)
+
+# ---- IFC_DM: read --------------------------------------------------------------
+
+def ifc_dm_list_objects(p):
+    """Cheap names-only listing of the IFC Data Mapping's object rules. Call
+    this FIRST — the office mapping has ~944 objects — to find the exact
+    name to pass as `object_name` to ifc_dm_dump instead of pulling everything.
+    params: {} (none)."""
+    cnt = _dm_cnt(_safe(lambda: vs.IFC_DMGetObjectsCnt()))
+    pairs, base = _dm_indexed(cnt, lambda i: vs.IFC_DMGetObjNameAt(i))
+    names = [n for _, n in pairs if n]
+    return {'status': 'ok', 'objects_cnt_reported': cnt,
+            'objects_cnt_returned': len(names), 'index_base_used': base,
+            'objects': names}
+
+def _dm_dump_pset_fields(objname, ename, pname):
+    cnt = _dm_cnt(_safe(lambda: vs.IFC_DMGetPSetFldsCnt(objname, ename, pname)))
+    pairs, base = _dm_indexed(cnt, lambda i: vs.IFC_DMGetPSetFldName(objname, ename, pname, i))
+    out = {}
+    for _, fname in pairs:
+        if not fname: continue
+        out[fname] = {
+            'map':      _dm_val(_safe(lambda: vs.IFC_DMGetPSetFldMap(objname, ename, pname, fname))),
+            'type':     _dm_val(_safe(lambda: vs.IFC_DMGetPSetFldType(objname, ename, pname, fname))),
+            'enabled':  bool(_safe(lambda: vs.IFC_DMIsPSetFldEnbl(objname, ename, pname, fname))),
+            'optional': bool(_safe(lambda: vs.IFC_DMIsPSetFldOpt(objname, ename, pname, fname))),
+            'empty':    bool(_safe(lambda: vs.IFC_DMIsPSetFldEmpty(objname, ename, pname, fname))),
+        }
+    return out, cnt, base
+
+def _dm_dump_entry_psets(objname, ename):
+    cnt = _dm_cnt(_safe(lambda: vs.IFC_DMGetEntPSetsCnt(objname, ename)))
+    pairs, base = _dm_indexed(cnt, lambda i: vs.IFC_DMGetPSetName(objname, ename, i))
+    out = {}
+    for pidx, pname in pairs:
+        if not pname: continue
+        # IFC_DMGetPSetCond takes a POSITIONAL psetIndex, not the pset name
+        # (unlike IFC_DMIsPSetEnabled, which does take the name) — reuse the
+        # same index this pset's name was just resolved at, same base as
+        # above. Assumption: that index space is the same one GetPSetName
+        # was just walked in — not confirmed live, just the natural reading
+        # of the two functions sharing an (obj, entry, index) shape.
+        cond = _dm_val(_safe(lambda: vs.IFC_DMGetPSetCond(objname, ename, pidx)))
+        fields, fcnt, fbase = _dm_dump_pset_fields(objname, ename, pname)
+        out[pname] = {
+            'enabled': bool(_safe(lambda: vs.IFC_DMIsPSetEnabled(objname, ename, pname))),
+            'condition': cond,
+            'fields_cnt_total': fcnt, 'fields_index_base': fbase,
+            'fields': fields,
+        }
+    return out, cnt, base
+
+def _dm_dump_entry_fields(objname, ename):
+    cnt = _dm_cnt(_safe(lambda: vs.IFC_DMGetFieldsCount(objname, ename)))
+    pairs, base = _dm_indexed(cnt, lambda i: vs.IFC_DMGetFieldName(objname, ename, i))
+    out = {}
+    for _, fname in pairs:
+        if not fname: continue
+        out[fname] = {
+            'map':      _dm_val(_safe(lambda: vs.IFC_DMGetFieldMap(objname, ename, fname))),
+            'type':     _dm_val(_safe(lambda: vs.IFC_DMGetFieldType(objname, ename, fname))),
+            'enabled':  bool(_safe(lambda: vs.IFC_DMIsFieldEnabled(objname, ename, fname))),
+            'optional': bool(_safe(lambda: vs.IFC_DMIsFieldOpt(objname, ename, fname))),
+            'empty':    bool(_safe(lambda: vs.IFC_DMIsFieldEmpty(objname, ename, fname))),
+        }
+    return out, cnt, base
+
+def _dm_dump_object(objname):
+    enabled = bool(_safe(lambda: vs.IFC_DMIsObjEnabled(objname)))
+    cond = _dm_val(_safe(lambda: vs.IFC_DMGetObjCond(objname)))
+    # IFC_DMGetObjCategory's index entry has a garbled 'cat' field
+    # ("INTEGER) : BOOLEAN;" instead of "IFC") -- looks like a parser
+    # artifact from a mangled source doc comment. Return type/meaning of the
+    # category code is therefore unconfirmed; passed through raw.
+    category = _dm_val(_safe(lambda: vs.IFC_DMGetObjCategory(objname)))
+    entry_cnt = _dm_cnt(_safe(lambda: vs.IFC_DMGetEntriesCnt(objname)))
+    # NOTE arg order: IFC_DMGetEntryName(index, objName) -- index BEFORE the
+    # object name, the one function in this family with that order reversed.
+    entry_pairs, entry_base = _dm_indexed(entry_cnt, lambda i: vs.IFC_DMGetEntryName(i, objname))
+    entries_out = {}
+    for eidx, ename in entry_pairs:
+        if not ename: continue
+        # IFC_DMGetEntryType(objName, index) -- takes (obj, index), reusing
+        # the entry's own index rather than its name.
+        etype = _dm_val(_safe(lambda: vs.IFC_DMGetEntryType(objname, eidx)))
+        fields, fcnt, fbase = _dm_dump_entry_fields(objname, ename)
+        psets, pcnt, pbase = _dm_dump_entry_psets(objname, ename)
+        entries_out[ename] = {
+            'enabled': bool(_safe(lambda: vs.IFC_DMIsEntryEnabled(objname, ename))),
+            'type': etype,
+            'fields_cnt_total': fcnt, 'fields_index_base': fbase, 'fields': fields,
+            'psets_cnt_total': pcnt, 'psets_index_base': pbase, 'psets': psets,
+        }
+    return {
+        'enabled': enabled, 'condition': cond, 'category': category,
+        'entries_cnt_total': entry_cnt, 'entries_index_base': entry_base,
+        'entries': entries_out,
+    }
+
+def ifc_dm_dump(p):
+    """Full (or single-object) dump of the current IFC Data Mapping:
+    Objects -> Entries -> Fields, and Entries -> PSets -> PSet-Fields, with
+    every state flag (Enabled/Optional/Empty) and condition (ObjCond,
+    PSetCond). params: {object_name (or object): optional name -- restrict to
+    one object rule; the full mapping can hold ~900+ object rules in a real
+    office document, so ALWAYS filter unless a full export is actually
+    wanted (see ifc_dm_list_objects to find the name first)}.
+
+    INDEX BASE -- READ THIS BEFORE TRUSTING THE OUTPUT: vs_index.json gives
+    no base convention (0- vs 1-based) for the IFC_DM* family, and this has
+    NOT been tested live (no bridge access from this task). Every list in
+    the output carries its own '*_index_base' sibling key: 0 or 1 means the
+    auto-probe found a clean run at that base; -1 means BOTH bases left
+    holes and the code kept its best guess -- treat that node's contents as
+    unverified and check it by hand in the real Data Mapping dialog. See
+    _dm_indexed's docstring for the reasoning behind trying 0 first.
+    """
+    only = p.get('object_name') or p.get('object')
+    obj_cnt = _dm_cnt(_safe(lambda: vs.IFC_DMGetObjectsCnt()))
+    obj_pairs, obj_base = _dm_indexed(obj_cnt, lambda i: vs.IFC_DMGetObjNameAt(i))
+    objects_out = {}
+    for _, name in obj_pairs:
+        if not name: continue
+        if only and name != only: continue
+        objects_out[name] = _dm_dump_object(name)
+    return {
+        'status': 'ok',
+        'objects_cnt_total': obj_cnt, 'objects_index_base': obj_base,
+        'objects_dumped': len(objects_out),
+        'objects': objects_out,
+    }
+
+# ---- IFC_DM: write ---------------------------------------------------------------
+
+def ifc_dm_add_entry(p):
+    """Add a new entry to an object's mapping rule. params: {object_name/object,
+    entry, enable(bool, default True)}."""
+    obj, entry = p.get('object_name') or p.get('object'), p.get('entry')
+    if not obj or not entry: return {'error': 'object_name, entry required'}
+    ok = vs.IFC_DMAddEntry(obj, entry, bool(p.get('enable', True)))
+    return {'status': 'ok', 'added': bool(ok)}
+
+def ifc_dm_add_field(p):
+    """Add a DIRECT field to an (object, entry) rule -- one that lives
+    outside any Pset (use ifc_dm_add_pset_field for a field inside a Pset).
+    params: {object_name/object, entry, field, type(IFC type string, default
+    'IfcLabel'), optional(bool, default False), enable(bool, default True),
+    empty(bool, default False)}."""
+    obj, entry, field = p.get('object_name') or p.get('object'), p.get('entry'), p.get('field')
+    if not obj or not entry or not field: return {'error': 'object_name, entry, field required'}
+    ok = vs.IFC_DMAddField(obj, entry, field, p.get('type', 'IfcLabel'),
+                            bool(p.get('optional', False)), bool(p.get('enable', True)),
+                            bool(p.get('empty', False)))
+    return {'status': 'ok', 'added': bool(ok)}
+
+def ifc_dm_add_pset(p):
+    """Attach a Pset to an existing (object, entry) mapping rule.
+    params: {object_name/object, entry, pset, enable(bool, default True),
+    condition(PSetCond formula string, optional, default '')}.
+
+    HOUSE RULE #6: uses IFC_DMAddPSetInEntry, NEVER IFC_DMAddPSetForEnt.
+    IFC_DMAddPSetForEnt combined with IFC_DMSetEntryType was observed to
+    silently create a SECOND duplicate entry instead of editing the
+    existing one -- IFC_DMAddPSetInEntry is the clean call for "add this
+    Pset under an entry that's already there". Do not swap this for
+    IFC_DMAddPSetForEnt even though it looks like a shorter path.
+    """
+    obj, entry, pset = p.get('object_name') or p.get('object'), p.get('entry'), p.get('pset')
+    if not obj or not entry or not pset: return {'error': 'object_name, entry, pset required'}
+    ok = vs.IFC_DMAddPSetInEntry(obj, entry, pset, bool(p.get('enable', True)),
+                                  str(p.get('condition', '') or ''))
+    return {'status': 'ok', 'added': bool(ok)}
+
+def ifc_dm_add_pset_field(p):
+    """Add a field to a Pset already attached to an (object, entry) rule
+    (call ifc_dm_add_pset first if the Pset itself isn't there yet).
+    params: {object_name/object, entry, pset, field, type(default 'IfcLabel'),
+    optional(bool, default False), enable(bool, default True),
+    empty(bool, default False)}."""
+    obj, entry = p.get('object_name') or p.get('object'), p.get('entry')
+    pset, field = p.get('pset'), p.get('field')
+    if not obj or not entry or not pset or not field:
+        return {'error': 'object_name, entry, pset, field required'}
+    ok = vs.IFC_DMAddPSetFld(obj, entry, pset, field, p.get('type', 'IfcLabel'),
+                              bool(p.get('optional', False)), bool(p.get('enable', True)),
+                              bool(p.get('empty', False)))
+    return {'status': 'ok', 'added': bool(ok)}
+
+def ifc_dm_enable_object(p):
+    """Enable/disable an object rule as a whole. params: {object_name/object,
+    enable(bool, default True)}."""
+    obj = p.get('object_name') or p.get('object')
+    if not obj: return {'error': 'object_name required'}
+    ok = vs.IFC_DMEnableObject(obj, bool(p.get('enable', True)))
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_dm_enable_entry(p):
+    """Enable/disable one entry under an object. params: {object_name/object,
+    entry, enable(bool, default True)}."""
+    obj, entry = p.get('object_name') or p.get('object'), p.get('entry')
+    if not obj or not entry: return {'error': 'object_name, entry required'}
+    ok = vs.IFC_DMEnableEntry(obj, entry, bool(p.get('enable', True)))
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_dm_enable_pset(p):
+    """Enable/disable a Pset under an (object, entry). params:
+    {object_name/object, entry, pset, enable(bool, default True)}."""
+    obj, entry, pset = p.get('object_name') or p.get('object'), p.get('entry'), p.get('pset')
+    if not obj or not entry or not pset: return {'error': 'object_name, entry, pset required'}
+    ok = vs.IFC_DMEnablePSet(obj, entry, pset, bool(p.get('enable', True)))
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_dm_set_entry_type(p):
+    """Set an entry's IfcEntry type -- documented only as "Primary/
+    Secondary"; the index gives no exact literal spelling, so the string is
+    passed through as-is (verify the office's real dialog for the exact
+    case/spelling before relying on this). params: {object_name/object, entry,
+    type}."""
+    obj, entry, etype = p.get('object_name') or p.get('object'), p.get('entry'), p.get('type')
+    if not obj or not entry or not etype: return {'error': 'object_name, entry, type required'}
+    ok = vs.IFC_DMSetEntryType(obj, entry, etype)
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_dm_set_object_condition(p):
+    """Set the ObjCond formula that decides whether this object rule
+    applies. params: {object_name/object, condition}."""
+    obj, cond = p.get('object_name') or p.get('object'), p.get('condition')
+    if not obj or cond is None: return {'error': 'object_name, condition required'}
+    ok = vs.IFC_DMSetObjectCond(obj, str(cond))
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_dm_set_field_map(p):
+    """Set a field's mapping-source formula, e.g. ='DTM6'.'Cut Volume'.
+    Targets a Pset field when `pset` is given, otherwise a direct entry
+    field. params: {object_name/object, entry, field, mapping, pset(optional)}."""
+    obj, entry, field = p.get('object_name') or p.get('object'), p.get('entry'), p.get('field')
+    mapping = p.get('mapping')
+    if not obj or not entry or not field or mapping is None:
+        return {'error': 'object_name, entry, field, mapping required'}
+    pset = p.get('pset')
+    if pset:
+        ok = vs.IFC_DMSetPSetFldMap(obj, entry, pset, field, str(mapping))
+    else:
+        ok = vs.IFC_DMSetFieldMap(obj, entry, field, str(mapping))
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_dm_set_field_flags(p):
+    """Set state flags on a DIRECT entry field (see
+    ifc_dm_set_pset_field_flags for a Pset field). Only flags actually
+    present in params are touched. params: {object_name/object, entry, field,
+    enabled?(bool), optional?(bool), empty?(bool), type?(str)}."""
+    obj, entry, field = p.get('object_name') or p.get('object'), p.get('entry'), p.get('field')
+    if not obj or not entry or not field: return {'error': 'object_name, entry, field required'}
+    changed = {}
+    if 'enabled' in p:
+        changed['enabled'] = bool(vs.IFC_DMSetFieldEnable(obj, entry, field, bool(p['enabled'])))
+    if 'optional' in p:
+        changed['optional'] = bool(vs.IFC_DMSetFieldOpt(obj, entry, field, bool(p['optional'])))
+    if 'empty' in p:
+        changed['empty'] = bool(vs.IFC_DMSetFieldEmpty(obj, entry, field, bool(p['empty'])))
+    if 'type' in p:
+        changed['type'] = bool(vs.IFC_DMSetFieldType(obj, entry, field, str(p['type'])))
+    if not changed:
+        return {'error': 'nothing to set -- pass at least one of enabled/optional/empty/type'}
+    return {'status': 'ok', 'changed': changed}
+
+def ifc_dm_set_pset_field_flags(p):
+    """Same as ifc_dm_set_field_flags but for a field inside a Pset.
+    params: {object_name/object, entry, pset, field, enabled?(bool),
+    optional?(bool), empty?(bool), type?(str)}."""
+    obj, entry = p.get('object_name') or p.get('object'), p.get('entry')
+    pset, field = p.get('pset'), p.get('field')
+    if not obj or not entry or not pset or not field:
+        return {'error': 'object_name, entry, pset, field required'}
+    changed = {}
+    if 'enabled' in p:
+        changed['enabled'] = bool(vs.IFC_DMSetPSetFldEnbl(obj, entry, pset, field, bool(p['enabled'])))
+    if 'optional' in p:
+        changed['optional'] = bool(vs.IFC_DMSetPSetFldOpt(obj, entry, pset, field, bool(p['optional'])))
+    if 'empty' in p:
+        changed['empty'] = bool(vs.IFC_DMSetPSetFldEmpt(obj, entry, pset, field, bool(p['empty'])))
+    if 'type' in p:
+        changed['type'] = bool(vs.IFC_DMSetPSetFldType(obj, entry, pset, field, str(p['type'])))
+    if not changed:
+        return {'error': 'nothing to set -- pass at least one of enabled/optional/empty/type'}
+    return {'status': 'ok', 'changed': changed}
+
+def ifc_dm_save(p):
+    """Save the current IFC Data Mapping via IFC_DMSaveSettings(inStrParam,
+    inObjName, bFileSettings).
+
+    UNVERIFIED / GUESSED -- vs_index.json gives no description of these
+    three arguments beyond their bare names. By analogy with the
+    'SaveSettings(param, objName, bFileSettings)' shape VW's other
+    plugin-object settings APIs use:
+      - to_file=True  -> `path` is treated as a FILE PATH; the mapping (or
+        just one object's rule, if `object_name` is given) is written to disk --
+        likely the actual mechanism behind the office's hand-maintained
+        9 MB Data-Mapping XML.
+      - to_file=False -> `path` is treated as a NAME under which the
+        mapping is stored as an in-document settings/resource entry
+        instead of a file.
+    Neither branch has been exercised against a live document from this
+    task. TEST ON A THROWAWAY FILE before trusting this against the real
+    XML. params: {path, object_name(optional, default ''), to_file(bool,
+    default True)}."""
+    path = p.get('path')
+    if not path: return {'error': 'path required'}
+    obj = p.get('object_name') or p.get('object') or ''
+    ok = vs.IFC_DMSaveSettings(str(path), str(obj), bool(p.get('to_file', True)))
+    return {'status': 'ok', 'saved': bool(ok)}
+
+def ifc_dm_load(p):
+    """Load an IFC Data Mapping via IFC_DMLoadSettings(inStrParam) --
+    presumed to REPLACE the current in-document mapping wholesale (no
+    merge behaviour or undo is documented anywhere in the index). ALWAYS
+    take an ifc_dm_dump() snapshot before calling this against a document
+    you care about.
+
+    UNVERIFIED / GUESSED: the single string could be a file path (mirroring
+    ifc_dm_save's to_file=True) or the name of an in-document settings
+    entry (mirroring to_file=False) -- this function takes no separate flag
+    to disambiguate, so it may auto-detect from the string's shape, or it
+    may only support one of the two. Passed through as-is; try a real file
+    path first since that matches the office's XML workflow. params:
+    {path}."""
+    path = p.get('path')
+    if not path: return {'error': 'path required'}
+    ok = vs.IFC_DMLoadSettings(str(path))
+    return {'status': 'ok', 'loaded': bool(ok)}
+
+# ---- IFC_DM: delete -----------------------------------------------------------
+
+def ifc_dm_delete_entry(p):
+    """Delete an entry (and everything nested under it: its fields and
+    Psets) from an object. params: {object_name/object, entry}."""
+    obj, entry = p.get('object_name') or p.get('object'), p.get('entry')
+    if not obj or not entry: return {'error': 'object_name, entry required'}
+    ok = vs.IFC_DMDeleteEntry(obj, entry)
+    return {'status': 'ok', 'deleted': bool(ok)}
+
+def ifc_dm_delete_field(p):
+    """Delete a direct entry field. params: {object_name/object, entry, field}."""
+    obj, entry, field = p.get('object_name') or p.get('object'), p.get('entry'), p.get('field')
+    if not obj or not entry or not field: return {'error': 'object_name, entry, field required'}
+    ok = vs.IFC_DMDeleteField(obj, entry, field)
+    return {'status': 'ok', 'deleted': bool(ok)}
+
+def ifc_dm_delete_pset(p):
+    """Remove a Pset (and its fields) from an (object, entry). params:
+    {object_name/object, entry, pset}."""
+    obj, entry, pset = p.get('object_name') or p.get('object'), p.get('entry'), p.get('pset')
+    if not obj or not entry or not pset: return {'error': 'object_name, entry, pset required'}
+    ok = vs.IFC_DMDelPSetFromEnt(obj, entry, pset)
+    return {'status': 'ok', 'deleted': bool(ok)}
+
+def ifc_dm_delete_pset_field(p):
+    """Delete one field from a Pset. params: {object_name/object, entry, pset,
+    field}."""
+    obj, entry = p.get('object_name') or p.get('object'), p.get('entry')
+    pset, field = p.get('pset'), p.get('field')
+    if not obj or not entry or not pset or not field:
+        return {'error': 'object_name, entry, pset, field required'}
+    ok = vs.IFC_DMDeletePSetFld(obj, entry, pset, field)
+    return {'status': 'ok', 'deleted': bool(ok)}
+
+# ---- IFC_DM: reset (destructive, deliberately gated) --------------------------
+# IFC_DMResetToDef() and IFC_DMResToCOBieDef() replace the ENTIRE current IFC
+# Data Mapping (all ~944 hand-maintained object rules in the office's
+# document) with VW's factory / COBie defaults, and no undo path is
+# documented anywhere in the index. Per the task's own instruction these are
+# NOT wrapped as plain callables. A boolean confirm flag was rejected
+# deliberately: a bool is exactly the kind of param an agent (or a
+# copy-pasted params dict from a previous, unrelated call) can end up
+# passing as True without anyone weighing the consequence. A literal,
+# single-purpose phrase cannot leak in by accident the same way.
+
+def ifc_dm_reset_to_default(p):
+    """DESTRUCTIVE. Wipes the ENTIRE current IFC Data Mapping and replaces
+    it with Vectorworks' factory defaults. No documented undo. Requires a
+    literal confirmation phrase, not a boolean -- see the module comment
+    above this function for why. params: {confirm: must be exactly
+    'RESET DATA MAPPING TO DEFAULTS'}."""
+    if p.get('confirm') != 'RESET DATA MAPPING TO DEFAULTS':
+        return {'error': "refused: pass confirm='RESET DATA MAPPING TO DEFAULTS' "
+                          "to actually wipe the entire IFC Data Mapping"}
+    ok = vs.IFC_DMResetToDef()
+    return {'status': 'ok', 'reset': bool(ok)}
+
+def ifc_dm_reset_to_cobie_default(p):
+    """DESTRUCTIVE, same risk class as ifc_dm_reset_to_default: replaces the
+    ENTIRE current IFC Data Mapping with Vectorworks' COBie default mapping.
+    Gated the same way and for the same reason. params: {confirm: must be
+    exactly 'RESET DATA MAPPING TO COBIE DEFAULTS'}."""
+    if p.get('confirm') != 'RESET DATA MAPPING TO COBIE DEFAULTS':
+        return {'error': "refused: pass confirm='RESET DATA MAPPING TO COBIE DEFAULTS' "
+                          "to actually wipe the entire IFC Data Mapping"}
+    ok = vs.IFC_DMResToCOBieDef()
+    return {'status': 'ok', 'reset': bool(ok)}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein klassenattribute
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Classes: shared appearance helpers ─────────────────────────────────────
+# (place directly above get_class_styles, i.e. right after _class_names_used())
+
+def _enumerate_class_names():
+    """Enumerate all class names in the active document.
+
+    A comment elsewhere in this file (near _class_names_used, ~line 477)
+    claims VW2026 removed class-name enumeration entirely. vs_index.json
+    disagrees: it lists ClassNum() and ClassList(index) as present, with no
+    deprecation notice. This is UNRESOLVED without a running VW2026 instance,
+    so try the documented API first and only fall back to walking objects if
+    it fails outright. Never invent a Class_N placeholder.
+
+    Returns (names, source) where source is 'ClassList' or 'objects_used'.
+    """
+    try:
+        n = vs.ClassNum()
+        if n and n > 0:
+            names = [vs.ClassList(i) for i in range(1, int(n) + 1)]
+            names = sorted({nm for nm in names if nm})
+            if names:
+                return names, 'ClassList'
+    except Exception:
+        pass
+    return _class_names_used(), 'objects_used'
+
+
+def _get_class_line_style(nm):
+    """Read a class's line style, preferring the live API over the deprecated one.
+
+    vs_index.json documents GetClLS as "Deprecated - will generate error. Use
+    GetClLSN instead." with no such notice on GetClLSN, so GetClLSN is tried
+    first. Falling back to GetClLS is a safety net, not an expected path.
+
+    Returns (value, source) where source names which call actually answered,
+    or (None, None) if both raised — never guess a value.
+    """
+    try:
+        return vs.GetClLSN(nm), 'GetClLSN'
+    except Exception:
+        pass
+    try:
+        return vs.GetClLS(nm), 'GetClLS (deprecated fallback)'
+    except Exception:
+        return None, None
+
+
+def _set_class_line_style(nm, value):
+    """Write a class's line style, preferring the live API over the deprecated one.
+
+    Mirrors _get_class_line_style: SetClLSN is the documented, undeprecated
+    setter; SetClLS is flagged "Deprecated - will generate error" in
+    vs_index.json. Try SetClLSN first; only fall back to SetClLS if SetClLSN
+    itself raises (e.g. genuinely absent from this VW build). Returns the
+    name of whichever call succeeded, so the caller never has to guess which
+    path ran. Lets the fallback's own exception propagate if both fail.
+    """
+    try:
+        vs.SetClLSN(nm, int(value))
+        return 'SetClLSN'
+    except Exception:
+        vs.SetClLS(nm, int(value))
+        return 'SetClLS (deprecated fallback)'
+
+
+def _read_class_appearance(nm):
+    """Read one class's full appearance. Colors are 0-255 RGB.
+
+    fill_pattern numbering (0=none, 1/2=solid, 14=hatch, negative=tile) is an
+    OFFICE CONVENTION inherited from a pre-existing code comment, not from
+    vs_index.json — the index documents SetClFPat/GetClFPat only as "sets/
+    returns the fill or hatch pattern", no numbers given. Treat it as
+    unverified until checked against a running VW2026 document.
+
+    opacity is vs.GetClOpacity's own percentage (VW convention, direction not
+    confirmed by the index) — do not assume it matches a "transparenz" column
+    without checking which way it runs; see set_class_appearance for the
+    same caveat on the write side.
+    """
+    d = {}
+    ff = _safe(lambda: vs.GetClFillFore(nm))
+    d['fill'] = [_c255(ff[0]), _c255(ff[1]), _c255(ff[2])] if ff else None
+    pf = _safe(lambda: vs.GetClPenFore(nm))
+    d['pen'] = [_c255(pf[0]), _c255(pf[1]), _c255(pf[2])] if pf else None
+    d['lineweight'] = _safe(lambda: vs.GetClLW(nm))       # VW mils; mm = lw * 0.0254
+    d['fill_pattern'] = _safe(lambda: vs.GetClFPat(nm))   # 0=none,1/2=solid,14=hatch,neg=tile — UNVERIFIED, see docstring
+    d['hatch'] = _safe(lambda: vs.GetClVectorFill(nm))    # hatch resource name, if any
+    d['opacity'] = _safe(lambda: vs.GetClOpacity(nm))     # percent 0-100, direction UNVERIFIED
+    ls, ls_source = _get_class_line_style(nm)
+    d['line_style'] = ls
+    d['line_style_source'] = ls_source
+    d['visible'] = _safe(lambda: vs.GetCVis(nm) == 0)
+    return d
+
+
+# ── Classes: replaces get_class_styles (was never wired to an @vtool; no
+#    other caller found in the repo) ────────────────────────────────────────
+
+
+
+# ── Classes: replaces set_class_appearance (adds fill_pattern, line_style,
+#    opacity, hatch; fill_r/g/b, pen_r/g/b, line_weight are unchanged) ──────
+
+
+
+# ── Classes: new — the missing read-back for set_class_appearance ─────────
+
+def get_class_appearance(p):
+    """Read one class's full appearance (fill/pen color, lineweight, fill
+    pattern, line style, opacity, hatch) — the read-back counterpart to
+    set_class_appearance, so a write can be verified. Pass {'name': str}.
+    Built on the same field reads as get_class_styles (see _read_class_appearance)."""
+    name = p.get('name', '')
+    if not name:
+        return {'error': 'name is required'}
+    d = _read_class_appearance(name)
+    d['class'] = name
+    return d
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein schraffuren
+# ──────────────────────────────────────────────────────────────────────────
+
+def create_hatch_definition(p):
+    """Create a new vector-fill (hatch) definition from layer geometry.
+    vs facts (verified in vs_index.json, category 'Hatches / Vector Fills'):
+      BeginVectorFillN(vectorFillName, pageSpace, rotateInWall, colorIndex) -> STRING
+          'The value of vectorFillName will change only if the hatch name
+          already exists.' (so VW itself can silently rename on collision --
+          we still pre-check + abort/replace explicitly and only rely on this
+          as a reported fallback, see 'note' in the result).
+      AddVectorFillLayer(xStart, yStart, xRepeat, yRepeat, xOffset, yOffset,
+                         dashFactor, lineWeight, colorIndex)  -- call once per
+          layer, strictly AFTER BeginVectorFillN and BEFORE EndVectorFill.
+      EndVectorFill()  -- closes the definition; must always run once Begin
+          has run, success or failure (Regel 8).
+      No reading vs.* function exists for an existing definition's layers
+      (only NumVectorFills()/VectorFillList(i) enumerate names, like
+      list_hatches already does) -- so existence can only be checked by name,
+      never by inspecting/diffing layer content.
+    """
+    name = p.get('name')
+    if not name:
+        return {'error': 'name required'}
+
+    layers_in = p.get('layers')
+    if not isinstance(layers_in, list) or not layers_in:
+        return {'error': 'layers must be a non-empty list'}
+
+    # ---- full validation BEFORE any vs.Begin* call (Regel 8) ----------------
+    layers = []
+    for i, ld in enumerate(layers_in):
+        if not isinstance(ld, dict):
+            return {'error': f'layers[{i}] must be an object'}
+        try:
+            x_start     = float(ld.get('x_start', 0))
+            y_start     = float(ld.get('y_start', 0))
+            x_repeat    = float(ld['x_repeat'])
+            y_repeat    = float(ld['y_repeat'])
+            x_offset    = float(ld.get('x_offset', 0))
+            y_offset    = float(ld.get('y_offset', 0))
+            dash_factor = float(ld.get('dash_factor', 0))
+            line_weight = int(ld.get('line_weight', 1))
+            color_idx   = int(ld.get('color_index', 0))
+        except (KeyError, TypeError, ValueError) as e:
+            return {'error': f'layers[{i}]: invalid or missing field ({e})'}
+        if x_repeat == 0 or y_repeat == 0:
+            return {'error': f'layers[{i}]: x_repeat and y_repeat must be non-zero'}
+        layers.append((x_start, y_start, x_repeat, y_repeat, x_offset, y_offset,
+                        dash_factor, line_weight, color_idx))
+
+    try:
+        page_space      = bool(p.get('page_space', False))
+        rotate_in_wall  = bool(p.get('rotate_in_wall', False))
+        def_color_index = int(p.get('color_index', 0))
+    except (TypeError, ValueError) as e:
+        return {'error': f'invalid page_space/rotate_in_wall/color_index: {e}'}
+
+    replace = bool(p.get('replace', False))
+
+    # ---- existence check (same enumeration path as list_hatches) -----------
+    try:
+        n = vs.NumVectorFills()
+        existing = set()
+        for i in range(1, n + 1):
+            try: existing.add(vs.VectorFillList(i))
+            except Exception: pass
+    except Exception as e:
+        return {'error': f'could not enumerate existing hatches: {e}'}
+
+    if name in existing:
+        if not replace:
+            return {'error': f'hatch "{name}" already exists', 'exists': True}
+        try:
+            vs.DelVectorFill(name)
+        except Exception as e:
+            return {'error': f'could not remove existing hatch "{name}" for replace: {e}'}
+
+    # ---- everything checked out -- only now open the definition ------------
+    started = False
+    created_name = None
+    fail = None
+    try:
+        created_name = vs.BeginVectorFillN(name, page_space, rotate_in_wall, def_color_index)
+        started = True
+        for lyr in layers:
+            vs.AddVectorFillLayer(*lyr)
+    except Exception as e:
+        fail = str(e)
+    finally:
+        # Regel 8: Begin/End is a hard pair -- End must run whenever Begin ran,
+        # success or failure, or every object drawn afterwards lands inside
+        # this hatch definition instead of on the drawing.
+        if started:
+            try:
+                vs.EndVectorFill()
+            except Exception as e:
+                if not fail:
+                    fail = f'EndVectorFill failed: {e}'
+
+    if fail:
+        # A half-built hatch definition in the office master file is its own
+        # kind of damage -- remove it rather than leave it behind.
+        if started:
+            try: vs.DelVectorFill(created_name or name)
+            except Exception: pass
+        return {'error': fail, 'partial_definition_removed': started}
+
+    result = {'status': 'ok', 'name': created_name or name, 'layer_count': len(layers)}
+    if created_name and created_name != name:
+        result['requested_name'] = name
+        result['note'] = 'VW returned a different name than requested (name likely collided)'
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein hybridsymbole
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Symbols: hybrid 2D/3D + type/options introspection ─────────────────────
+# Research findings this section builds on (see task brief):
+#   - vs.GetSymbolType(objectHandle) works on a PLACED INSTANCE, not a symbol
+#     definition handle. Return values per the brief: 0=2D, 1=3D, 2=HYBRID,
+#     -1=error (vs_index.json's own doc string for this call is truncated
+#     after "The return values are:", so this mapping is taken from the
+#     research already done, not re-derived here).
+#   - vs.GetSymDefSubType/SetSymDefSubType (also in the index) are for
+#     PLUG-IN STYLES, not 2D/3D classification — intentionally not used here.
+#   - vs.CreateSymbolFromObjects does not exist in the VS/Python API. Both
+#     create_symbol_from_objects (existing) and create_hybrid_symbol (new)
+#     build a symbol definition the only way available: BeginSym(name) opens
+#     a recording scope, HDuplicate() on each source object creates a copy
+#     THAT LANDS INSIDE the scope, EndSym() closes it.
+#   - vs.ForEachObject has NO early-abort: a Python-side limit on how many
+#     handles the callback keeps does not stop the underlying VW engine walk.
+#     A criteria string needs its OWN layer/type scoping to bound the cost;
+#     "(T=SYMBOL) & (S='name')" alone still forces a full-document walk
+#     because VW must test every object's type/name to find matches. This is
+#     the same class of freeze the house rules warn about for _collect().
+#   - Folder placement for a freshly created symbol does NOT use
+#     vs.InsertSymbolInFolder or an inline BeginFolder()/EndFolder() pair
+#     here. Both were already tried and found unreliable elsewhere in this
+#     file (see resource_move / resource_create_folder, ~line 4443/4482):
+#     InsertSymbolInFolder's doc text ("Inserts a symbol definition into the
+#     referenced symbol folder") never promises a return value at all (ret=""
+#     with NO "returns ..." wording — contrast GetBBox, also ret="" but its
+#     doc explicitly says "Procedure GetBBox returns the bounding box
+#     coordinates...", i.e. var/out-params that DO carry data back) and was
+#     found to be a silent no-op in live testing; vs.SetParent (BOOLEAN
+#     return, verified reliable, used by resource_move) is what actually
+#     moves a resource into a folder. And an empty BeginFolder()/EndFolder()
+#     pair with nothing created in between (to make a bare folder shell) is
+#     exactly the pattern resource_create_folder already probes and found
+#     UNRELIABLE on VW2026 (worked once, then never again) — it verifies via
+#     an FSymDef before/after diff instead of trusting the call, and reports
+#     honestly when it fails. create_hybrid_symbol reuses those two
+#     already-verified helpers instead of duplicating (and re-breaking) that
+#     logic inline. DEPENDENCY: this means create_hybrid_symbol calls
+#     resource_move() and resource_create_folder() as plain Python functions
+#     within this module — both already exist elsewhere in commands.py, this
+#     section does not redefine them.
+
+
+def get_symbol_type(p):
+    """Classify a symbol as 2D-only, 3D-only, or hybrid. params: {object_id}
+    (a placed symbol instance — cheap, exact, no search) OR {name, layer}
+    (looks up the FIRST placed instance of a symbol definition, scoped to
+    ONE layer, because GetSymbolType only accepts an instance handle, not a
+    definition handle).
+
+    SAFETY (freeze risk): vs.ForEachObject has no early-abort — it walks
+    every object in whatever scope its criteria string describes, no matter
+    how small a limit the Python callback applies. A criteria like
+    "(T=SYMBOL) & (S='name')" alone has NO layer filter, so it forces a
+    full-document walk just to find one instance — on a large office file
+    this is the exact pattern that has frozen VW for 15+ minutes before.
+    So {name} WITHOUT {layer} is refused outright here, not silently run.
+    Pass {object_id} for an exact O(1) lookup, or pass {layer} to bound the
+    search to "(T=SYMBOL) & (S='name') & (L='layer')" — still a full walk of
+    that ONE layer, but not the whole document.
+
+    A single quote inside {name} or {layer} is escaped by doubling it
+    (VectorScript/Pascal string-literal convention: 'It''s a test') before
+    being embedded in the criteria string, so a name like "Fritz' Beet" does
+    not break the expression. NOTE: this doubling convention was not
+    verified against a live VW criteria parser in this task — it is the
+    standard Pascal/VectorScript escape and is applied defensively; if VW's
+    criteria parser turns out to want something else, this call will simply
+    find nothing (empty result), not corrupt data.
+
+    If {name} (+ {layer}) has no placed instance on that layer, this returns
+    an explicit 'no instance placed' error instead of guessing a type.
+    Returns the raw VW integer AND a word: 0/'2d', 1/'3d', 2/'hybrid',
+    anything else (including -1)/'unknown'."""
+    TYPE_WORDS = {0: '2d', 1: '3d', 2: 'hybrid'}
+    oid = p.get('object_id')
+    name = p.get('name')
+    layer = p.get('layer')
+    h = None
+    if oid:
+        h = _h(oid)
+        if not h:
+            return {'error': f'Object not found: {oid}'}
+    elif name:
+        if not layer:
+            return {'error': (
+                "name lookup requires 'layer' to bound the search. "
+                "vs.ForEachObject has no early-abort, so a name-only "
+                "criteria walks the WHOLE document even to find a single "
+                "instance -- this has frozen VW for 15+ minutes on a large "
+                "file before. Pass object_id for an exact, cheap lookup, or "
+                "pass layer to scope the search to one layer.")}
+        safe_name = str(name).replace("'", "''")
+        safe_layer = str(layer).replace("'", "''")
+        hs = _collect(f"(T=SYMBOL) & (S='{safe_name}') & (L='{safe_layer}')", limit=1)
+        if not hs:
+            return {'error': 'no instance placed on that layer',
+                    'name': name, 'layer': layer}
+        h = hs[0]
+    else:
+        return {'error': 'object_id required, or name + layer'}
+
+    t = _safe(lambda: vs.GetSymbolType(h))
+    if t is None or t == -1:
+        return {'error': 'GetSymbolType failed or returned -1',
+                'raw_type': t, 'object_id': _oid(h)}
+    return {
+        'status': 'ok',
+        'object_id': _oid(h),
+        'name': name or _safe(lambda: vs.GetName(h)),
+        'type': t,
+        'type_name': TYPE_WORDS.get(t, 'unknown'),
+    }
+
+
+def get_symbol_options(p):
+    """Read a symbol definition's default class + insert/break mode via
+    vs.GetSymbolOptionsN(name). params: {name}.
+
+    WARNING — tuple order not confirmed: vs_index.json documents this call
+    only as "Returns default class, insert options, and break options" with
+    no stated order, while its counterpart SetSymbolOptionsN takes
+    (name, insertMode, breakMode, clasName). Whether Get mirrors that
+    positional order or the doc-text order (class, insert, break) could not
+    be verified against a live document in this task. 'raw' is therefore
+    returned UNCHANGED as ground truth; the *_guess fields are a best-effort
+    label using SetSymbolOptionsN's order and must be treated as unverified."""
+    name = p.get('name')
+    if not name:
+        return {'error': 'name required'}
+    h = _safe(lambda: vs.GetObject(name))
+    if not h:
+        return {'error': f'Symbol not found: {name}'}
+    raw = _safe(lambda: vs.GetSymbolOptionsN(name))
+    if raw is None:
+        return {'error': f'GetSymbolOptionsN failed for symbol: {name}'}
+    result = {
+        'status': 'ok',
+        'name': name,
+        'raw': raw,
+        'order_verified': False,
+        'warning': ("GetSymbolOptionsN's tuple order is not documented in "
+                    "vs_index.json and was not verified live. Use 'raw' as "
+                    "ground truth; insert_mode_guess/break_mode_guess/"
+                    "class_name_guess assume the same order as "
+                    "SetSymbolOptionsN's trailing args."),
+    }
+    try:
+        vals = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+    except TypeError:
+        vals = [raw]
+    for label, v in zip(('insert_mode_guess', 'break_mode_guess', 'class_name_guess'), vals):
+        result[label] = v
+    return result
+
+
+def set_symbol_options(p):
+    """Set a symbol definition's default class + insert/break mode via
+    vs.SetSymbolOptionsN(name, insertMode, breakMode, clasName). params:
+    {name, insert_mode, break_mode, class_name}.
+
+    WARNING: SetSymbolOptionsN has no return value (VS procedure, ret='' in
+    the index, and its doc text never says "returns ..." the way GetBBox's
+    does), so success can NOT be verified here — a bad name or a VW-internal
+    rejection would fail silently. status:'ok' only means the call did not
+    raise. Read back with get_symbol_options() to confirm.
+    The integer meanings of insert_mode/break_mode are a VW-internal
+    enumeration not resolved in vs_index.json (doc text is truncated before
+    listing the values) — pass raw ints the caller already knows, e.g. read
+    from get_symbol_options() on a reference symbol."""
+    name = p.get('name')
+    if not name:
+        return {'error': 'name required'}
+    h = _safe(lambda: vs.GetObject(name))
+    if not h:
+        return {'error': f'Symbol not found: {name}'}
+    insert_mode = int(p.get('insert_mode', 0))
+    break_mode = int(p.get('break_mode', 0))
+    class_name = p.get('class_name', '') or ''
+    _safe(lambda: vs.SetSymbolOptionsN(name, insert_mode, break_mode, class_name))
+    return {
+        'status': 'ok',
+        'name': name,
+        'insert_mode': insert_mode,
+        'break_mode': break_mode,
+        'class_name': class_name,
+        'warning': ("SetSymbolOptionsN returns no value; success is not "
+                    "verified. Call get_symbol_options() to confirm."),
+    }
+
+
+def create_hybrid_symbol(p):
+    """Create a symbol definition from BOTH 2D and 3D source objects. params:
+    {name, object_ids_2d, object_ids_3d, folder, class_name, insert_mode,
+    break_mode}. object_ids_2d/object_ids_3d are lists of object_id (UUID).
+
+    HOW IT WORKS: same primitive as create_symbol_from_objects — there is no
+    vs.CreateSymbolFromObjects. ALL object_ids are resolved to handles FIRST;
+    only if at least one resolves does BeginSym(name) open a recording scope.
+    Every HDuplicate() call made while it's open lands inside the new
+    definition. This duplicates the 2D list, then the 3D list, into that SAME
+    scope, then closes it with EndSym() (guaranteed via try/finally, with a
+    began-flag so EndSym is only ever called if BeginSym actually ran —
+    matching the fix applied to create_symbol_from_objects below).
+
+    WHY RESOLVE BEFORE BeginSym: a symbol scope opened with nothing valid to
+    put in it leaves an EMPTY symbol definition sitting in the document —
+    clutter in a shared office file that someone then has to notice and
+    delete by hand. If every object_id is invalid, this function returns an
+    error WITHOUT ever calling BeginSym, so no such symbol is created. (It is
+    still possible, though less likely, for a handle that resolved via
+    GetObjectByUuid to fail at the HDuplicate() step itself once the scope is
+    already open; that residual case IS reported explicitly in the result
+    below rather than hidden behind a generic error.)
+
+    HONEST LIMITS — none of this was verified against a live document in
+    this task (no bridge access permitted here):
+      - Whether VW's engine then classifies the result as an actual HYBRID
+        symbol (GetSymbolType == 2 on a placed instance) is UNCONFIRMED.
+        Mixing duplicated 2D-planar and 3D-solid objects in one BeginSym
+        scope is plausible for producing a hybrid, but it could equally
+        yield a plain 3D symbol whose plan view is just VW's auto top
+        projection of the 3D geometry with the 2D objects drawn alongside —
+        visually similar, not necessarily the same internal classification.
+        ALWAYS call get_symbol_type() on a placed instance afterward to
+        check what VW actually produced; this function cannot check that
+        itself (GetSymbolType needs an instance, not a fresh definition).
+      - vs_index.json separately exposes Get2DComponentGroup/
+        Set2DComponentGroup('objectHandle, component' / '..., groupHandle,
+        component'), documented as getting/setting "the specified 2D
+        component group of a symbol definition or plug-in object" and
+        mentioning "Top/Plan" as a target — this looks like VW's real
+        mechanism for giving a symbol an explicit plan-only 2D component
+        separate from its 3D content. It is NOT used here: the numeric
+        'component' enum value (e.g. what number means Top/Plan) is not in
+        the index and was not verified, so wiring it in would mean guessing
+        a magic number silently.
+      - Layer plane vs. screen plane: the task brief requires hybrid symbols
+        to be inserted in the layer plane. No vs.* function in the index
+        toggles this (searched for Plane/ScreenPlane/LayerPlane/2DPlane/
+        DrawPlane — nothing dedicated turned up). HDuplicate() only offsets
+        an object; it does not move it between planes. This function
+        therefore does NOT force layer-plane placement — it inherits
+        whatever plane the source objects already occupy. Callers must pass
+        object_ids that are already real layer-plane objects (drawn on a
+        design layer), not screen-plane annotations.
+      - 'folder' placement calls the already-verified resource_move() /
+        resource_create_folder() helpers elsewhere in this file instead of
+        vs.InsertSymbolInFolder or a bare BeginFolder()/EndFolder() pair —
+        see the section header comment above for why those two were
+        rejected. resource_create_folder is itself documented as UNRELIABLE
+        on VW2026 (worked once in testing, then never again); if it fails,
+        this function says so in 'warnings' rather than claiming the folder
+        was made.
+    """
+    name = p.get('name', 'NewHybridSymbol')
+    ids2d = p.get('object_ids_2d') or []
+    ids3d = p.get('object_ids_3d') or []
+    if not ids2d and not ids3d:
+        return {'error': 'object_ids_2d and/or object_ids_3d required'}
+
+    # Resolve every object_id to a handle BEFORE opening BeginSym — see
+    # docstring "WHY RESOLVE BEFORE BeginSym" above.
+    resolved_2d, failed_2d = [], []
+    for oid in ids2d:
+        h = _h(oid)
+        if h:
+            resolved_2d.append(h)
+        else:
+            failed_2d.append(oid)
+    resolved_3d, failed_3d = [], []
+    for oid in ids3d:
+        h = _h(oid)
+        if h:
+            resolved_3d.append(h)
+        else:
+            failed_3d.append(oid)
+
+    if not resolved_2d and not resolved_3d:
+        return {'error': 'no source objects resolved (all object_ids invalid); '
+                          'BeginSym was NOT called, no empty symbol was created',
+                'failed_2d': failed_2d, 'failed_3d': failed_3d}
+
+    warnings = [
+        "UNVERIFIED: whether this actually produces a symbol VW classifies "
+        "as HYBRID (GetSymbolType == 2) was not confirmed in this task (no "
+        "live bridge access). Call get_symbol_type on a placed instance to check.",
+        "This does not change plane. Source objects are duplicated as-is — "
+        "make sure object_ids_2d/object_ids_3d already live on the layer "
+        "plane, not the screen plane.",
+    ]
+
+    began = False
+    made2d = made3d = 0
+    dup_failed_2d, dup_failed_3d = [], []
+    try:
+        vs.BeginSym(name)
+        began = True
+        for h in resolved_2d:
+            d = _safe(lambda h=h: vs.HDuplicate(h, 0, 0))
+            if d:
+                made2d += 1
+            else:
+                dup_failed_2d.append(_oid(h))
+        for h in resolved_3d:
+            d = _safe(lambda h=h: vs.HDuplicate(h, 0, 0))
+            if d:
+                made3d += 1
+            else:
+                dup_failed_3d.append(_oid(h))
+    except Exception as e:
+        return {'error': f'create_hybrid_symbol failed: {e}',
+                'made_2d': made2d, 'made_3d': made3d,
+                'failed_2d': failed_2d + dup_failed_2d,
+                'failed_3d': failed_3d + dup_failed_3d}
+    finally:
+        if began:
+            _safe(lambda: vs.EndSym())
+
+    if made2d == 0 and made3d == 0:
+        # BeginSym/EndSym DID run (at least one object_id resolved to a
+        # handle going in) but every HDuplicate() call failed once the scope
+        # was open. That DOES leave an empty symbol definition named `name`
+        # behind — say so plainly instead of returning a bare error as if
+        # nothing had happened.
+        return {'error': "all HDuplicate calls failed inside BeginSym/EndSym "
+                          f"-- an EMPTY symbol definition named '{name}' was "
+                          "left behind; delete it manually if unwanted",
+                'failed_2d': failed_2d + dup_failed_2d,
+                'failed_3d': failed_3d + dup_failed_3d}
+
+    # Optional default class / insert / break mode on the freshly-made def.
+    if p.get('class_name') is not None or p.get('insert_mode') is not None or p.get('break_mode') is not None:
+        sym_h = _safe(lambda: vs.GetObject(name))
+        if sym_h:
+            insert_mode = int(p.get('insert_mode', 0))
+            break_mode = int(p.get('break_mode', 0))
+            class_name = p.get('class_name', '') or ''
+            _safe(lambda: vs.SetSymbolOptionsN(name, insert_mode, break_mode, class_name))
+        else:
+            warnings.append(f"could not resolve new symbol '{name}' via GetObject to apply symbol options")
+
+    # Optional folder placement — via resource_move / resource_create_folder,
+    # NOT vs.InsertSymbolInFolder or an inline BeginFolder/EndFolder pair.
+    # See the section header comment above for the full reasoning.
+    folder = p.get('folder')
+    if folder:
+        fld_h = _safe(lambda: vs.GetObject(folder))
+        if not fld_h or _safe(lambda: vs.GetTypeN(fld_h)) != 92:
+            created = resource_create_folder({'name': folder})
+            if created.get('status') != 'ok':
+                warnings.append(f"folder '{folder}' does not exist and could "
+                                 f"not be created: {created.get('error')}")
+                fld_h = None
+            else:
+                fld_h = _h(created.get('object_id'))
+        if fld_h:
+            moved = resource_move({'name': name, 'folder': folder})
+            if not moved.get('moved'):
+                warnings.append(
+                    f"symbol '{name}' was created but could not be moved "
+                    f"into folder '{folder}': "
+                    f"{moved.get('error', 'vs.SetParent returned False')}")
+
+    return {
+        'status': 'ok',
+        'name': name,
+        'objects_2d': made2d,
+        'objects_3d': made3d,
+        'failed_2d': failed_2d + dup_failed_2d,
+        'failed_3d': failed_3d + dup_failed_3d,
+        'warnings': warnings,
+    }
+
+
+# ── REPLACES the existing create_symbol_from_objects (same section, ~line 2063) ──
+# Fix: the old version called vs.BeginSym(name) BEFORE resolving any of the
+# object_ids, so a call with every object_id invalid still opened the
+# recording scope and left an EMPTY symbol definition behind (clutter in a
+# shared office file). It also never checked whether BeginSym succeeded and
+# had no finally, so any exception between BeginSym and EndSym left the
+# recording scope open — every object drawn afterward would silently land in
+# this symbol definition. Below: resolve everything first (mirrors the fix in
+# create_hybrid_symbol above), and try/except/finally guarantees EndSym runs
+# whenever BeginSym ran, and never lets an exception escape (house rule:
+# always return a dict, never raise).
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein dokumentwechsel
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Fenster-/Dokument-Hilfsfunktionen ───────────────────────────────────────
+# (ersetzt die bisherigen _win32, _fenster_titel, _fenster_klasse,
+#  _dokumentfenster, _grundname — Reihenfolge unveraendert, Aufrufer bleiben
+#  kompatibel: gleiche Signaturen, gleiche Rueckgabeform.)
+#
+# Kein vs.ForEachObject/_collect in diesem Baustein: list_documents,
+# switch_document und confirm_active_document lesen ausschliesslich ueber
+# die Win32-Fensterliste (ctypes/user32) und vs.GetFName()/vs.GetFPathName()
+# (je arity 0, kein Kriterienstring, kein Dokumentdurchlauf) — das Freeze-
+# Risiko aus _collect()/ForEachObject betrifft diesen Baustein nicht.
+
+_DOC_EXT = ('.vwx', '.vwxp', '.sta')
+_KLAMMER_RE = re.compile(r'\[([^\[\]]+)\]')     # klassisches MFC-MDI-Titelmuster "App - [Doc]"
+_STERN_RE = re.compile(r'^[\*\s]+|[\*\s]+$')    # Aenderungsmarker (Stern) UND Leerraum, beidseitig
+_TOKEN_TRENN_RE = re.compile(r'[^a-z0-9]+')     # Tokengrenzen fuer den Namens-Teiltreffer
+
+
+
+
+
+
+
+
+def _entstern(s):
+    """Strip a modified-doc marker (asterisk) and stray whitespace from
+    EITHER end — the exact convention VW uses ('*file', 'file*', 'file *')
+    is not confirmed, so this is deliberately side-agnostic."""
+    return _STERN_RE.sub('', s or '')
+
+
+def _dateiname_aus_text(t):
+    """Best-effort document file name out of arbitrary window-title text.
+
+    Tries a '[...]' segment first (the classic MFC MDI title-merge format,
+    "AppName - [Doc.vwx]", used when a child window's own caption merges
+    into the frame's — see the maximized-window note in _dokumentfenster),
+    then the whole text with the existing ' - '/' — '/' – ' splitting.
+    Returns '' if nothing recognisable turns up — never guesses a name that
+    doesn't actually contain a known document extension.
+    """
+    if not t:
+        return ''
+    for kandidat in list(_KLAMMER_RE.findall(t)) + [t]:
+        kl = kandidat.lower()
+        if any(ext in kl for ext in _DOC_EXT):
+            datei = kandidat
+            for trenner in (' - ', ' — ', ' – '):
+                if trenner in datei:
+                    datei = datei.split(trenner)[0]
+            return _entstern(datei).strip()
+    return ''
+
+
+
+
+
+
+def _namens_teiltreffer(ziel_grund, ganzer_grund):
+    """Whole-token partial match on two already-normalised (lower-case,
+    _grundname()'d) base names.
+
+    A raw `ziel in ganzer` substring test lets a fragment match inside an
+    unrelated, longer name — e.g. 'musterdatei' would also match inside
+    'AltMusterdatei.vwx' or 'Musterdateikopie.vwx'. For switch_document that
+    means the wrong file gets brought to front; for confirm_active_document
+    it means exactly the false confirmation that function exists to rule
+    out before a write. Splitting both sides on every non-alphanumeric
+    character ('_', '-', '.', space, ...) and requiring the target's tokens
+    to appear as a contiguous run keeps VW's own naming convention working
+    (`260717_Musterdatei.vwx` -> tokens ['260717', 'musterdatei', 'vwx'], so
+    'musterdatei' still matches as a whole token) while rejecting a match
+    that only shares characters, not a token boundary.
+    """
+    if not ziel_grund:
+        return False
+    ziel_tok = [t for t in _TOKEN_TRENN_RE.split(ziel_grund) if t]
+    ganz_tok = [t for t in _TOKEN_TRENN_RE.split(ganzer_grund) if t]
+    if not ziel_tok:
+        return False
+    n = len(ziel_tok)
+    return any(ganz_tok[i:i + n] == ziel_tok for i in range(len(ganz_tok) - n + 1))
+
+
+def _pfad_endet_mit(erwarteter_teilpfad, echter_pfad):
+    """True if `echter_pfad` ends with `erwarteter_teilpfad`, aligned on
+    '/'-separated path segments. Caller passes both already lower-cased and
+    normalised to forward slashes.
+
+    A raw `a in b` substring test lets 'ProjektA/Musterdatei.vwx' match
+    inside '.../AltProjektA/Musterdatei.vwx': every character is present,
+    just not starting at a folder boundary — so confirm_active_document
+    would report a match against the wrong project folder. Comparing whole
+    segments closes that gap: each segment of the expected tail must equal,
+    not merely be contained in, the corresponding segment of the real
+    path's tail.
+    """
+    a_teile = [t for t in erwarteter_teilpfad.split('/') if t]
+    b_teile = [t for t in echter_pfad.split('/') if t]
+    if not a_teile or len(a_teile) > len(b_teile):
+        return False
+    return b_teile[len(b_teile) - len(a_teile):] == a_teile
+
+
+# ── Dokumente ────────────────────────────────────────────────────────────────
+
+
+
+
+
+def confirm_active_document(p):
+    """Confirm which document is active after switch_document. params:
+    {expected: name} — a base file name (e.g. 'Musterdatei.vwx') or, to also
+    rule out the same-basename-different-folder case, a full (or partial,
+    folder-including) path matched against vs.GetFPathName(). 'name' is
+    accepted as an alias of 'expected' for manual-call convenience, but
+    'expected' is the documented, English tool parameter.
+
+    Call this as the NEXT command after switch_document — switch_document
+    only posts the request and cannot see whether it landed; this is the
+    first command that runs inside whatever document actually ended up
+    active, so it is the only thing that can check it.
+    """
+    expected = (p.get('expected') or p.get('name') or '').strip()
+    if not expected:
+        return {'error': 'Bitte expected (Dateiname oder voller Pfad) angeben.'}
+
+    aktiv = _safe(vs.GetFName, '') or ''
+    pfad = _safe(vs.GetFPathName, '') or ''
+
+    ziel_grund = _grundname(expected)
+    aktiv_grund = _grundname(aktiv)
+
+    # Namensvergleich auf Tokengrenzen statt roher Teilstring-Suche (siehe
+    # _namens_teiltreffer): "musterdatei" darf "260717_Musterdatei.vwx"
+    # treffen, aber nicht "AltMusterdatei.vwx" — genau die Verwechslung, die
+    # confirm_active_document ausschliessen soll, vor einer schreibenden
+    # Folgeaktion.
+    treffer_name = _namens_teiltreffer(ziel_grund, aktiv_grund)
+
+    sieht_wie_pfad = '/' in expected or '\\' in expected
+    treffer_pfad = None  # None = kein Pfadvergleich versucht (expected war kein Pfad)
+    if sieht_wie_pfad:
+        if pfad:
+            # Nur die Richtung "expected steckt im echten Pfad" zaehlt. Die
+            # Umkehrung ("echter Pfad endet auf dem Basisnamen von expected")
+            # waere bei zwei gleichnamigen Dateien in verschiedenen Ordnern
+            # IMMER wahr und wuerde bei einem noch nie gespeicherten Dokument
+            # (pfad == '') sogar fuer JEDEN erwarteten Pfad zutreffen, weil
+            # str.endswith('') immer True ist — deshalb bewusst nicht benutzt.
+            #
+            # Segmentweiser Vergleich (_pfad_endet_mit) statt "a in b": eine
+            # rohe Teilstring-Pruefung wuerde 'ProjektA/Musterdatei.vwx' auch
+            # in '.../AltProjektA/Musterdatei.vwx' faelschlich erkennen, weil
+            # die Zeichenkette darin vorkommt, nur eben nicht an einer
+            # Ordnergrenze beginnend. Genau dieser Fall war der offene
+            # Befund aus Runde 2.
+            treffer_pfad = _pfad_endet_mit(
+                expected.replace('\\', '/').lower(),
+                pfad.replace('\\', '/').lower())
+        else:
+            # expected nennt einen Pfad, aber das aktive Dokument hat (noch)
+            # keinen (nie gespeichert) — der Pfad kann nicht bestaetigt werden.
+            treffer_pfad = False
+
+    if sieht_wie_pfad:
+        # 'expected' wurde bewusst als Pfad angegeben, gerade um zwei
+        # gleichnamige Dateien in verschiedenen Ordnern zu unterscheiden. Der
+        # Namensvergleich (treffer_name) trifft auf BEIDE zu und darf diese
+        # Unterscheidung nicht per ODER wieder aufheben — sonst waere der
+        # ganze Pfadvergleich wirkungslos. Der Pfadvergleich allein
+        # entscheidet in diesem Fall.
+        stimmt = bool(treffer_pfad)
+    else:
+        stimmt = treffer_name
+
+    return {'status': 'ok', 'stimmt': stimmt, 'expected': expected,
+            'aktiv': aktiv, 'aktiv_pfad': pfad or None,
+            'treffer_name': treffer_name, 'treffer_pfad': treffer_pfad,
+            'hinweis': ('Aktives Dokument passt.' if stimmt else
+                        'Aktives Dokument passt NICHT zu "expected" — der '
+                        'Wechsel ist vermutlich noch nicht angekommen, oder '
+                        'es wurde das falsche Fenster getroffen.')}
+
+
+# ── Zubehör v2: resource lists, native import/duplicate, style relink, nesting guard ──
+# Verified on VW2026 (2026-09-14/15, landscape site plan project):
+#   * No vs.* call creates a plug-in object style. SetPluginStyle / AddToPluginStyle /
+#     SetSymDefSubType only assign or tag. vs.CreateDuplicateObject(symDef, None) returns
+#     an invalid handle. BeginSym + CreateDuplicateObject(innerPIO, newSymDef) produces a
+#     style WITHOUT its hidden data (Data Tag layout fields, plant style parameter map);
+#     objects using it developed runaway nesting (hundreds of nested PIOs).
+#   * NEVER vs.ResetObject a plug-in object that lives inside a symbol definition (e.g. the
+#     inner plant of a plant style). Doing so filled plants with captured document content.
+#   * Data Tag field/layout definitions have no scripting API: UI only (Resource Manager).
+#   * A native duplicate works via import: rename the existing resource to a temp name,
+#     import the original name from a SAVED file (vs.BuildResourceListN + ImportResToCurFileN),
+#     rename the import to the new name, rename the temp back. Import skips resources that
+#     are identical to one already in the document (documented behaviour), which is why the
+#     temp rename is needed. The copy reflects the SAVED file, not unsaved edits.
+#   * Plants link to a plant style by name: Plant fields PlantDescription, 'Plant Name
+#     Formula' ("\"<style>\"") and isCustom=False, then ResetObject.
+#   * After editing a Data Tag style, new tags only render correctly after DT_ResetAllDataTags.
+#   * A plant style's inner plant may be edited (spread/height + ResetObject); reset the
+#     instances twice afterwards (the first regen still shows the old hidden symbol size).
+#   * Maxon/Laubwerk 3D: copying lw_* fields does NOT generate the proxy mesh; the mesh is
+#     created by the UI inside the style. Set it once, then resource_duplicate that style for
+#     other sizes and change spread/height: the mesh scales with the instance.
+#   * vs.GetObject(name) returns a dummy handle (type 0) for unknown names (see _name_obj);
+#     vs.FInGroup() of an EMPTY group returns a handle into the parent list (see _deep_count).
+#   * Resource type numbers (BuildResourceList): 16 symbol/style, 18 worksheet, 19 material,
+#     47 record format, 66 hatch, 92 symbol folder, 96 line type, 97 texture, 109 text style,
+#     120 gradient.
+
+RESOURCE_TYPES = {'symbol': 16, 'style': 16, 'worksheet': 18, 'material': 19, 'record': 47,
+                  'hatch': 66, 'folder': 92, 'linetype': 96, 'texture': 97,
+                  'textstyle': 109, 'gradient': 120}
+
+
+def _res_type(p):
+    t = p.get('type', 16)
+    if isinstance(t, str):
+        t = RESOURCE_TYPES.get(t.lower(), None) if not t.isdigit() else int(t)
+    return t
+
+
+def _res_names(rtype, path=None):
+    if path:
+        lid, n = vs.BuildResourceListN(rtype, path)
+    else:
+        lid, n = vs.BuildResourceList(rtype, 0, '')
+    return lid, [vs.GetNameFromResourceList(lid, i) for i in range(1, n + 1)]
+
+
+def resource_list(p):
+    """List resources of one type WITHOUT handle walks (BuildResourceList).
+    params: type (int or alias: symbol, style, worksheet, material, record, hatch, folder,
+            linetype, texture, textstyle, gradient; default 16), file_path (optional saved
+            .vwx to read from), filter (optional substring, case-insensitive)."""
+    rtype = _res_type(p)
+    if rtype is None:
+        return {'error': 'unknown type alias', 'aliases': sorted(RESOURCE_TYPES)}
+    try:
+        _, names = _res_names(rtype, p.get('file_path'))
+    except Exception as e:
+        return {'error': 'BuildResourceList failed: %r' % e}
+    f = (p.get('filter') or '').lower()
+    if f:
+        names = [n for n in names if f in n.lower()]
+    return {'status': 'ok', 'type': rtype, 'count': len(names), 'names': names}
+
+
+def _name_obj(name):
+    """vs.GetObject returns a dummy handle (type 0) for names that do not exist."""
+    h = _safe(lambda: vs.GetObject(name or ''))
+    if h is None or _safe(lambda: vs.GetTypeN(h), 0) == 0:
+        return None
+    return h
+
+
+def _pio_name(h):
+    return _safe(lambda: vs.GetName(vs.GetParametricRecord(h)), '')
+
+
+def _deep_count(h, cap=500, max_depth=4):
+    """Count objects inside a group-like container (PIO, group, symbol def), capped."""
+    c = [0]
+
+    # VW2026 trap: FInGroup() of an EMPTY group returns a handle into the PARENT list
+    # (e.g. the layer), so a naive walk counts the whole layer as 'nested'. Count a
+    # child only if its parent really is the container (compared by UUID).
+    def walk(container, first, depth):
+        cu = _safe(lambda: vs.GetObjectUuid(container), None)
+        items = []
+        vs.ForEachObjectInList(lambda o: items.append(o), 0, 0, first)
+        for o in items:
+            pu = _safe(lambda: vs.GetObjectUuid(vs.GetParent(o)), None)
+            if cu is not None and pu != cu:
+                continue
+            c[0] += 1
+            if c[0] >= cap:
+                return
+            if vs.GetTypeN(o) in (11, 86) and depth < max_depth:
+                g = vs.FInGroup(o)
+                if g is not None:
+                    walk(o, g, depth + 1)
+
+    first = vs.FInSymDef(h) if vs.GetTypeN(h) == 16 else vs.FInGroup(h)
+    if first is not None:
+        walk(h, first, 0)
+    return c[0]
+
+
+def resource_info(p):
+    """Inspect one resource by name. For symbol definitions reports subtype, whether it is a
+    plug-in style (and of which PIO), contents, and a capped nesting count.
+    params: name."""
+    h = _name_obj(p.get('name', ''))
+    if h is None:
+        return {'error': 'not found: %s' % p.get('name')}
+    t = vs.GetTypeN(h)
+    out = {'status': 'ok', 'name': vs.GetName(h), 'type': t}
+    if t == 16:
+        inner = []
+        first = vs.FInSymDef(h)
+        if first is not None:
+            vs.ForEachObjectInList(lambda o: inner.append(o), 0, 0, first)
+        pios = [_pio_name(o) for o in inner if vs.GetTypeN(o) == 86]
+        out.update({'subtype': _safe(lambda: vs.GetSymDefSubType(h)),
+                    'inner_types': [vs.GetTypeN(o) for o in inner][:50],
+                    'inner_pio': pios,
+                    'is_plugin_style': bool(pios) and len(inner) == 1,
+                    'nesting_count': _deep_count(h)})
+    return out
+
+
+def _import_one(path, rtype, name):
+    lid, names = _res_names(rtype, path)
+    if name not in names:
+        return None, 'not in source file: %s' % name
+    idx = names.index(name) + 1
+    h = vs.ImportResToCurFileN(lid, idx, lambda *a: 0)
+    return h, None
+
+
+def resource_import(p):
+    """Import a resource from a saved .vwx through Vectorworks' native import (hidden style
+    data travels with it). If the name already exists in the document, the existing resource
+    is kept and the import is placed under new_name via a temp-rename swap.
+    params: file_path, name, type (default 16), new_name (optional)."""
+    path, name, rtype = p.get('file_path'), p.get('name'), _res_type(p)
+    new_name = p.get('new_name')
+    if not path or not name:
+        return {'error': 'file_path and name required'}
+    if new_name and _name_obj(new_name) is not None:
+        return {'error': 'new_name already in use (global namespace): %s' % new_name}
+    existing = _name_obj(name)
+    tmp = None
+    if existing is not None:
+        if not new_name:
+            return {'error': 'name exists in document; give new_name to import a copy'}
+        tmp = '%s__vwxmcp_tmp' % name
+        vs.SetName(existing, tmp)
+        if vs.GetName(existing) != tmp:
+            return {'error': 'temp rename failed'}
+    try:
+        h, err = _import_one(path, rtype, name)
+        if err or h is None:
+            return {'error': err or 'import returned no handle'}
+        if new_name:
+            vs.SetName(h, new_name)
+        return {'status': 'ok', 'imported': vs.GetName(h), 'object_type': vs.GetTypeN(h),
+                'nesting_count': _deep_count(h) if vs.GetTypeN(h) == 16 else None}
+    finally:
+        if tmp is not None and existing is not None:
+            vs.SetName(existing, name)
+
+
+def resource_duplicate(p):
+    """Duplicate a resource natively (import-swap from the SAVED document). Unsaved edits to
+    the resource are NOT included — save first. Works for symbols and plug-in styles
+    (plant, data tag, ...). Never edits the copy's inner objects by ResetObject.
+    params: name, new_name, type (default 16), source_file (default: this document's saved
+            path; copied to a temp file before reading)."""
+    import os, shutil, tempfile
+    name, new_name = p.get('name'), p.get('new_name')
+    if not name or not new_name:
+        return {'error': 'name and new_name required'}
+    src = p.get('source_file') or _safe(lambda: vs.GetFPathName(), '')
+    if not src or not os.path.isfile(src):
+        return {'error': 'no saved source file (save the document first): %s' % src}
+    tmpdir = tempfile.mkdtemp(prefix='vwxmcp_dup_')
+    copy = os.path.join(tmpdir, 'source.vwx')
+    shutil.copy2(src, copy)
+    try:
+        r = resource_import({'file_path': copy, 'name': name, 'type': _res_type(p),
+                             'new_name': new_name})
+    finally:
+        _safe(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    if r.get('status') == 'ok':
+        r['note'] = 'copy reflects the saved file state of %s' % os.path.basename(src)
+    return r
+
+
+def pio_nesting_check(p):
+    """Read-only guard against runaway nesting: counts objects inside each matching plug-in
+    object (capped) and flags anything above threshold.
+    params: criteria (e.g. "(L='LL_03_Bäume') & (PON='Plant')"), cap (default 200),
+            threshold (default 50)."""
+    crit = p.get('criteria')
+    if not crit:
+        return {'error': 'criteria required (no full-document walks)'}
+    cap, thr = int(p.get('cap', 200)), int(p.get('threshold', 50))
+    hs = _collect(crit, limit=int(p.get('limit', 5000)))
+    heavy = []
+    for h in hs:
+        n = _deep_count(h, cap=cap)
+        if n > thr:
+            heavy.append({'object_id': _oid(h), 'count': n, 'class': vs.GetClass(h)})
+    return {'status': 'ok', 'checked': len(hs), 'heavy': heavy, 'clean': not heavy}
+
+
+def plant_style_relink(p):
+    """Link Plant objects to an existing plant style/definition by name.
+    Returns the previous links so a caller can restore them. Regeneration is delayed:
+    run pio_nesting_check in a SEPARATE call afterwards and restore if anything is heavy.
+    params: object_ids (list) or criteria, style (name of an existing plant style)."""
+    style = p.get('style')
+    sd = _name_obj(style)
+    if sd is None or vs.GetTypeN(sd) != 16:
+        return {'error': 'plant style not found: %s' % style}
+    hs = [_h(i) for i in (p.get('object_ids') or [])] or _collect(p.get('criteria') or '', 5000)
+    hs = [h for h in hs if h is not None and _pio_name(h) == 'Plant']
+    if not hs:
+        return {'error': 'no Plant objects matched'}
+    R = 'Plant'
+    prev = []
+    for h in hs:
+        prev.append((h, vs.GetRField(h, R, 'PlantDescription'), vs.GetRField(h, R, 'Plant Name Formula'),
+                     vs.GetRField(h, R, 'isCustom')))
+        vs.SetRField(h, R, 'PlantDescription', style)
+        vs.SetRField(h, R, 'Plant Name Formula', '"%s"' % style)
+        vs.SetRField(h, R, 'isCustom', 'Falsch')
+        vs.ResetObject(h)
+    return {'status': 'ok', 'relinked': len(hs),
+            'previous': [{'object_id': _oid(h), 'PlantDescription': d, 'Plant Name Formula': f,
+                          'isCustom': c} for h, d, f, c in prev],
+            'next': 'run pio_nesting_check in a separate call (regeneration is delayed)'}
+
+
+def datatag_refresh_all(p):
+    """Re-render every Data Tag in the document (needed after editing a Data Tag style)."""
+    vs.DT_ResetAllDataTags()
+    return {'status': 'ok'}
+
+
+# ---------------------------------------------------------------------------
+# Erdbau (Auf-/Abtrag-Bilanz) — lived only in the deployed plug-in folder since
+# 2026-09 and was never committed; restored into the repo 2026-10-06 so a
+# redeploy of the repo copy cannot delete it.
+# ---------------------------------------------------------------------------
+
+def _erdbau_shoelace(pts):
+    s = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _erdbau_pip(x, y, poly):
+    """Ray casting. Eigene Implementierung, weil vs.PtInPoly bei Polygonen
+    mit Loch nicht verlaesslich ist."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _erdbau_contour(uuid, wbb):
+    """Aussenkontur der 2D-Komponente in Weltkoordinaten.
+    -> (punkte, bandflaeche, transformation_plausibel)"""
+    import math
+    o = vs.GetObjectByUuid(uuid)
+    if not o:
+        return None, None, False
+    rot = vs.GetSymRot(o)
+    sym = vs.GetObject(vs.GetSymName(o))
+    poly = None
+    c = vs.FInGroup(sym)
+    while c:
+        if vs.GetTypeN(c) in (5, 21):
+            try:
+                if vs.GetVertNum(c) >= 3:
+                    poly = c
+                    break
+            except Exception:
+                pass
+        c = vs.NextObj(c)
+    if not poly:
+        return None, None, False
+    n = vs.GetVertNum(poly)
+    P = [(vs.GetPolyPt(poly, k)[0], vs.GetPolyPt(poly, k)[1]) for k in range(1, n + 1)]
+    a = math.radians(rot)
+    ca, sa = math.cos(a), math.sin(a)
+    R = [(q[0] * ca - q[1] * sa, q[0] * sa + q[1] * ca) for q in P]
+    rminx, rminy = min(q[0] for q in R), min(q[1] for q in R)
+    rmaxx, rmaxy = max(q[0] for q in R), max(q[1] for q in R)
+    ok = (abs((rmaxx - rminx) - (wbb[1][0] - wbb[0][0])) < 0.5 and
+          abs((rmaxy - rminy) - (wbb[1][1] - wbb[0][1])) < 0.5)
+    tx, ty = wbb[0][0] - rminx, wbb[0][1] - rminy
+    return [(q[0] + tx, q[1] + ty) for q in R], vs.HAreaN(poly), ok
+
+
+def _erdbau_parse_m3(s):
+    s = str(s).strip()
+    if not s or s.startswith('<'):
+        return None
+    s = s.replace('m\u00b3', '').replace('m3', '').strip().replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def erdbau_bilanz(p):
+    """TG-Anteil im Auftrag rechnen und in LL-Erdbau schreiben.
+
+    params:
+      site_model_uuid  UUID des Gelaendemodells (Pflicht)
+      cell             Rasterweite in m, Vorgabe 2.0 (2.0 -> ca. 0,2 % Flaechenfehler)
+      tg_layer         Ebene der TG-Symbole, Vorgabe 'CGA_TG'
+      bodies           optional: [[uuid, name, z_uk, z_ok, [[x0,y0],[x1,y1]]], ...]
+      write            Vorgabe True; False = nur rechnen, nichts schreiben
+    """
+    import time
+    smu = p.get('site_model_uuid')
+    if not smu:
+        return {'error': 'site_model_uuid fehlt'}
+    sm = vs.GetObjectByUuid(smu)
+    if not sm:
+        return {'error': 'Gelaendemodell nicht gefunden'}
+    cell = float(p.get('cell', 2.0))
+    A = cell * cell
+    bodies = p.get('bodies') or _ERDBAU_BODIES_DEFAULT
+
+    out = []
+    tot = {'area': 0.0, 'env': 0.0, 'auf': 0.0, 'unter': 0.0, 'ueber': 0.0}
+    for b in bodies:
+        uuid, tag, z_lo, z_deck, wbb = b[0], b[1], float(b[2]), float(b[3]), b[4]
+        poly, band, ok = _erdbau_contour(uuid, wbb)
+        if not poly or not ok:
+            out.append({'sym': tag, 'error': 'Transformation nicht plausibel'})
+            continue
+        area = _erdbau_shoelace(poly)
+        x0 = min(q[0] for q in poly); x1 = max(q[0] for q in poly)
+        y0 = min(q[1] for q in poly); y1 = max(q[1] for q in poly)
+        cells = 0
+        auf = unter = ueber = 0.0
+        fails = 0
+        y = y0 + cell / 2.0
+        while y < y1:
+            x = x0 + cell / 2.0
+            while x < x1:
+                if _erdbau_pip(x, y, poly):
+                    cells += 1
+                    vs.Locus3D(x, y, 0.0); L = vs.LNewObj()
+                    okB = vs.DTM6_SendToSurface(sm, L, 3)
+                    zb = vs.GetLocus3D(L)[2]; vs.DelObject(L)
+                    vs.Locus3D(x, y, 0.0); L = vs.LNewObj()
+                    okS = vs.DTM6_SendToSurface(sm, L, 1)
+                    zs = vs.GetLocus3D(L)[2]; vs.DelObject(L)
+                    if okB and okS:
+                        ov = min(z_deck, zs) - max(z_lo, zb)
+                        if ov > 0: auf += ov * A
+                        ub = min(z_deck, zb) - z_lo
+                        if ub > 0: unter += ub * A
+                        ob = z_deck - max(z_lo, zs)
+                        if ob > 0: ueber += ob * A
+                    else:
+                        fails += 1
+                x += cell
+            y += cell
+        env = area * (z_deck - z_lo)
+        out.append({'sym': tag, 'area': round(area, 2),
+                    'band_area': round(band, 2) if band else None,
+                    'area_err_pct': round(100.0 * (cells * A - area) / area, 2),
+                    'envelope': round(env, 1), 'im_auftrag': round(auf, 1),
+                    'unter_bestand': round(unter, 1), 'ueber_soll': round(ueber, 1),
+                    'fails': fails})
+        tot['area'] += area; tot['env'] += env
+        tot['auf'] += auf; tot['unter'] += unter; tot['ueber'] += ueber
+
+    beton = 0.0
+    hs = []
+    vs.ForEachObject(lambda h: hs.append(h),
+                     "(L='%s')" % p.get('tg_layer', 'CGA_TG'))
+    for h in hs:
+        if vs.GetTypeN(h) != 15:
+            continue
+        sym = vs.GetObject(vs.GetSymName(h))
+        c = vs.FInGroup(sym)
+        while c:
+            if vs.GetTypeN(c) == 84:
+                v = vs.ObjVolume(c)
+                if v: beton += v
+            c = vs.NextObj(c)
+
+    fill = _erdbau_parse_m3(vs.GetRField(sm, 'DTM6', 'Fill Volume'))
+    cut = _erdbau_parse_m3(vs.GetRField(sm, 'DTM6', 'Cut Volume'))
+    res = {'status': 'ok', 'cell_m': cell, 'bodies': out,
+           'beton_m3': round(beton, 3),
+           'footprint_m2': round(tot['area'], 1),
+           'envelope_m3': round(tot['env'], 1),
+           'im_auftrag_m3': round(tot['auf'], 1),
+           'unter_bestand_m3': round(tot['unter'], 1),
+           'ueber_soll_m3': round(tot['ueber'], 1),
+           'fill_volume': fill, 'cut_volume': cut}
+
+    if p.get('write', True):
+        for nm, dv, ft in _ERDBAU_FIELDS:
+            try: vs.NewField(_ERDBAU_REC, nm, dv, ft, 0)
+            except Exception: pass
+        vs.SetRecord(sm, _ERDBAU_REC)
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Volumen_Beton', '%.3f' % beton)
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Huellvolumen', '%.3f' % tot['env'])
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Anteil_im_Auftrag', '%.3f' % tot['auf'])
+        # Die TG steht auf BEIDEN Seiten der Bilanz: auf der Auftragsseite wird
+        # sie abgezogen, auf der Abtragsseite addiert. DGM Cut vergleicht nur
+        # zwei Oberflaechen und enthaelt die Baugrube nicht.
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Anteil_im_Abtrag', '%.3f' % tot['unter'])
+        vs.SetRField(sm, _ERDBAU_REC, 'Stand', time.strftime('%Y-%m-%d %H:%M'))
+        if fill is not None:
+            vs.SetRField(sm, _ERDBAU_REC, 'Fuellboden_brutto', '%.3f' % fill)
+            vs.SetRField(sm, _ERDBAU_REC, 'Fuellboden_netto',
+                         '%.3f' % (fill - tot['auf']))
+            res['note'] = 'ok'
+        if cut is not None:
+            vs.SetRField(sm, _ERDBAU_REC, 'Aushub_brutto', '%.3f' % cut)
+            vs.SetRField(sm, _ERDBAU_REC, 'Aushub_gesamt',
+                         '%.3f' % (cut + tot['unter']))
+        else:
+            res['note'] = ('Fill Volume nicht gerechnet - erst '
+                           '"Auftrag/Abtrag aktualisieren" am Gelaendemodell')
+        res['written'] = {f[0]: vs.GetRField(sm, _ERDBAU_REC, f[0])
+                          for f in _ERDBAU_FIELDS}
+    return res
+
+
+def erdbau_read(p):
+    """Aktuelle LL-Erdbau-Werte am Gelaendemodell lesen. params: site_model_uuid."""
+    sm = vs.GetObjectByUuid(p.get('site_model_uuid', ''))
+    if not sm:
+        return {'error': 'Gelaendemodell nicht gefunden'}
+    if not vs.GetObject(_ERDBAU_REC):
+        return {'error': 'Datensatz %s existiert nicht' % _ERDBAU_REC}
+    return {'status': 'ok',
+            'values': {f[0]: vs.GetRField(sm, _ERDBAU_REC, f[0])
+                       for f in _ERDBAU_FIELDS},
+            'dtm6': {k: vs.GetRField(sm, 'DTM6', k)
+                     for k in ('Fill Volume', 'Cut Volume', 'Geometry Zref')}}
+
+
+def erdbau_tg_probe(p):
+    """Diagnose ohne Schreiben: Grundrissflaeche, Bandprobe (Umfang x 0,30
+    gegen die Netto-Polygonflaeche) und Hoehenstufen je TG-Koerper.
+    params: tg_layer (Vorgabe 'CGA_TG'), bodies (optional)."""
+    import math
+    bodies = p.get('bodies') or _ERDBAU_BODIES_DEFAULT
+    out = []
+    for b in bodies:
+        uuid, tag, z_lo, z_deck, wbb = b[0], b[1], float(b[2]), float(b[3]), b[4]
+        poly, band, ok = _erdbau_contour(uuid, wbb)
+        d = {'sym': tag, 'transform_ok': ok}
+        if poly:
+            per = 0.0
+            for i in range(len(poly)):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % len(poly)]
+                per += math.hypot(x2 - x1, y2 - y1)
+            d.update({'verts': len(poly), 'area': round(_erdbau_shoelace(poly), 2),
+                      'perimeter': round(per, 2),
+                      'band_area': round(band, 2) if band else None,
+                      'band_check_30cm': round(per * 0.30, 2),
+                      'z_lo': z_lo, 'z_deck': z_deck})
+        o = vs.GetObjectByUuid(uuid)
+        if o:
+            sym = vs.GetObject(vs.GetSymName(o))
+            c = vs.FInGroup(sym)
+            while c:
+                if vs.GetTypeN(c) == 84:
+                    g = vs.Get3DInfo(c); cc = vs.Get3DCntr(c)
+                    d['solid'] = {'vol_beton': round(vs.ObjVolume(c), 3),
+                                  'z_lo_real': round(cc[1] - g[2] / 2.0, 3),
+                                  'z_hi_real': round(cc[1] + g[2] / 2.0, 3)}
+                c = vs.NextObj(c)
+        out.append(d)
+    return {'status': 'ok', 'bodies': out}

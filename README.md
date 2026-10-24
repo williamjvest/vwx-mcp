@@ -1,8 +1,8 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 291 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
+**Vectorworks 2027 MCP server — 291 tools + a 3098-function `vs.*` knowledge index, true background control (bridge v15).**
 
-Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
+Drive a live Vectorworks 2027 session (2026: branch `vw2026`; port notes: [docs/VECTORWORKS_2027.md](docs/VECTORWORKS_2027.md)) from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
 OnIdle notification queue, writes reach VW through its own message queue — no
 watchdog process, no focus juggling, structurally crash-proof.
@@ -11,7 +11,7 @@ watchdog process, no focus juggling, structurally crash-proof.
 > the three access layers, object addressing, toolset presets, and the VW2026
 > API gotchas that will otherwise bite you.
 
-## Architecture (Windows, bridge v13)
+## Architecture (Windows, bridge v15)
 
 ```
 MCP client (Claude Code / Desktop)
@@ -23,7 +23,8 @@ mcp-server/vwx_mcp_server.py     (standalone fastmcp 3.x)
 VwxBridge.vlb   (native C++ web palette inside Vectorworks)
     │ palette open = bridge on; 100ms timer:
     │   reads  → OnIdle notification → vwx_pump.pump_readonly()
-    │   writes → Ctrl+Shift+B accelerator (posted key when VW backgrounded)
+    │   writes → ISDK::DoMenuName("VWX Bridge Start") via a message-only
+    │            window (v15; no keystrokes, no focus needed)
     │   + auto-dismisses VW error dialogs (content-matched) → never blocks
     ▼
 "VWX Bridge Start" Python menu command  (VW's script runner —
@@ -38,20 +39,24 @@ bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`, [legacy/](legacy/README.md
 
 ## Install (Windows)
 
-1. Copy `vwx-plugin/` contents to `%APPDATA%\Nemetschek\Vectorworks\2026\Plug-ins\VWX-MCP\`
-   (the legacy folder name `VW-MCP` also works).
+1. `bridge/install_user_plugin.ps1` copies `vwx-plugin/` to
+   `%APPDATA%\Nemetschek\Vectorworks\<year>\Plug-ins\VW-MCP\` and prints the manual
+   steps below. After a major-version upgrade, recreate the menu command (step 5)
+   and the menu entries in the new version; migrated ones do not work (see
+   [docs/VECTORWORKS_2027.md](docs/VECTORWORKS_2027.md)).
 2. Copy `mcp-server/vwx_mcp_server.py`, `mcp-server/tool_tags.py`, and
    `mcp-server/requirements.txt` to `%USERPROFILE%\.local\share\vwx-mcp\`
 3. Copy `bridge/vwx-mcp.bat` to `%USERPROFILE%\bridge\`. `python` on PATH —
    the launcher creates a venv + installs `fastmcp` on first run.
-4. **Native palette**: build `native/VwxBridge2026.vcxproj` (VS2022 BuildTools,
-   `VWSDK2026` env → SDK root containing `SDKLib`), then copy
-   `native/Output/Release/VwxBridge.vlb` + `VwxBridge.vwr` to
-   `C:\Program Files\Vectorworks 2026\Plug-ins\` (VW closed, admin).
+4. **Native palette**: build `native/VwxBridge2027.vcxproj` (VS2022 BuildTools,
+   `VWSDK2027` env → SDK root containing `SDKLib`), then copy
+   `native/Output/2027/Release/VwxBridge.vlb` + `VwxBridge.vwr` to
+   `C:\Program Files\Vectorworks 2027\Plug-ins\` (VW closed, admin; `bridge/deploy_native_bridge.bat` does it).
 5. **Executor command (one-time, in VW)**: Plug-in Manager → Eigene Plug-ins →
    Neu… → Menübefehl (Python) named **"VWX Bridge Start"**, code =
-   `vwx-plugin/BridgeStart_MenuCommand.py`. Workspace editor: add it to a menu +
-   assign **Ctrl+Shift+B**; also add "VWX Bridge Palette anzeigen". Restart VW.
+   `vwx-plugin/BridgeStart_MenuCommand.py` (VW2027: select it → "Code…").
+   The bridge calls it by this exact name. Workspace editor: add it and
+   "VWX Bridge Palette anzeigen" to Extras; Ctrl+Shift+B is optional (manual run).
 
 Rebuild the knowledge index after an SDK bump:
 `python tools/build_vs_index.py <path-to-SDK>/vs.py` → redeploy `vs_index.json`.
@@ -64,8 +69,8 @@ constraint forces a three-role split (trigger → executor → work; see
 
 | Part (repo → deploy) | Role |
 |---|---|
-| `native/` → `VwxBridge.vlb`+`.vwr` in `C:\Program Files\Vectorworks 2026\Plug-ins\` | **trigger** — native palette: heartbeat, background keystroke, error-dialog auto-dismiss |
-| `vwx-plugin/BridgeStart_MenuCommand.py` → "VWX Bridge Start" menu command (Ctrl+Shift+B) | **executor** — the only VW context where document mutation is safe |
+| `native/` → `VwxBridge.vlb`+`.vwr` in `C:\Program Files\Vectorworks 2027\Plug-ins\` | **trigger** — native palette: heartbeat, `DoMenuName` trigger (v15), error-dialog auto-dismiss |
+| `vwx-plugin/BridgeStart_MenuCommand.py` → "VWX Bridge Start" menu command | **executor** — the only VW context where document mutation is safe |
 | `vwx-plugin/{vwx_pump,commands}.py` + `vs_index.json` → `…\Plug-ins\VW-MCP\` | **work** — pump drains the queue, commands do the `vs.*`, index gives signatures |
 | `mcp-server/` → `~\.local\share\vwx-mcp\`, `bridge/vwx-mcp.bat` → `~\bridge\` | MCP server (writes jobs, reads results) |
 

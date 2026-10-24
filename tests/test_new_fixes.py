@@ -357,118 +357,70 @@ class ExportFailClosedTests(unittest.TestCase):
     def setUpClass(cls):
         cls.commands = load_commands()
 
-    def test_export_image_requires_absolute_path(self):
-        result = self.commands.export_image({"path": "relative/path.png"})
+    def test_export_image_returns_error_without_object_id(self):
+        # VW2027: ExportImageFile(hImage, filePath) exports Image OBJECTS, not
+        # the drawing. Without an object_id the command fails honestly.
+        result = self.commands.export_image({"path": "/tmp/out.png"})
         self.assertIn("error", result)
-        self.assertIn("absolute", result["error"])
+        self.assertIn("ExportImageFile", result["error"])
 
-    def test_export_image_requires_nonempty_path(self):
-        result = self.commands.export_image({})
-        self.assertIn("error", result)
-        self.assertIn("path is required", result["error"])
-
-    def test_export_image_rejects_unknown_extension(self):
-        result = self.commands.export_image({"path": "/tmp/out.bmp"})
-        self.assertIn("error", result)
-        self.assertIn("unsupported", result["error"])
-
-    def test_export_image_rejects_missing_parent_dir(self):
-        result = self.commands.export_image(
-            {"path": "/nonexistent_dir_abc123/out.png"})
-        self.assertIn("error", result)
-        self.assertIn("directory does not exist", result["error"])
-
-    def test_export_image_reports_no_file_after_call(self):
+    def test_export_image_exports_image_object_when_object_id_supplied(self):
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "out.png")
-            # ExportImageFile does nothing (no real VW) — file won't exist
+            fake_h = object()
+            calls = []
             original_vs = self.commands.vs
+            original_h = self.commands._h
             self.commands.vs = types.SimpleNamespace(
-                ExportImageFile=lambda *args: None)
+                ExportImageFile=lambda h, p: calls.append((h, p)))
+            self.commands._h = lambda oid: fake_h
             try:
-                result = self.commands.export_image({"path": path})
+                result = self.commands.export_image(
+                    {"path": path, "object_id": "some-uuid"})
             finally:
                 self.commands.vs = original_vs
-        self.assertIn("error", result)
-        self.assertIn("no file was written", result["error"])
-
-    def test_export_image_succeeds_when_file_is_written(self):
-        import tempfile, os
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "out.png")
-
-            def fake_export(p, w, h, dpi, fmt):
-                # Write a minimal file to simulate success
-                with open(p, "wb") as f:
-                    f.write(b"\x89PNG\r\n\x1a\n")
-
-            original_vs = self.commands.vs
-            self.commands.vs = types.SimpleNamespace(ExportImageFile=fake_export)
-            try:
-                result = self.commands.export_image({"path": path})
-            finally:
-                self.commands.vs = original_vs
+                self.commands._h = original_h
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["path"], path)
-        self.assertGreater(result["size"], 0)
+        self.assertEqual(calls, [(fake_h, path)])
 
     def test_export_pdf_returns_modal_required(self):
         result = self.commands.export_pdf({})
         self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
         self.assertIn("modal", result["detail"].lower())
 
-    def test_export_shp_returns_modal_required(self):
+    def test_export_shp_returns_error(self):
+        # VW2027: export_shp fails honestly — vs.ExportSHP does not exist.
         result = self.commands.export_shp({})
-        self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
+        self.assertIn("error", result)
 
-    def test_import_dwg_returns_modal_required(self):
+    def test_import_dwg_requires_path(self):
+        # VW2027: import_dwg calls vs.ImportDXFDWG — no path = error.
         result = self.commands.import_dwg({})
-        self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
-
-    def test_export_dxf_without_path_returns_modal_required(self):
-        result = self.commands.export_dxf({})
-        self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
-
-    def test_export_dxf_with_relative_path_errors(self):
-        result = self.commands.export_dxf({"path": "out.dxf"})
         self.assertIn("error", result)
-        self.assertIn("absolute", result["error"])
 
-    def test_export_dxf_missing_parent_dir_errors(self):
-        result = self.commands.export_dxf({"path": "/nonexistent_xyz/out.dxf"})
-        self.assertIn("error", result)
-        self.assertIn("directory does not exist", result["error"])
-
-    def test_export_dxf_reports_no_file_after_batch_call(self):
-        import tempfile, os
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "out.dxf")
-            original_vs = self.commands.vs
-            self.commands.vs = types.SimpleNamespace(
-                ExportDXFDWG_Batch=lambda p: None)
-            try:
-                result = self.commands.export_dxf({"path": path})
-            finally:
-                self.commands.vs = original_vs
-        self.assertIn("error", result)
-        self.assertIn("no file was written", result["error"])
-
-    def test_export_dxf_succeeds_when_file_written(self):
-        import tempfile, os
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "out.dxf")
-            def fake_batch(p):
-                with open(p, "wb") as f:
-                    f.write(b"AC1015")  # minimal DXF header
-            original_vs = self.commands.vs
-            self.commands.vs = types.SimpleNamespace(ExportDXFDWG_Batch=fake_batch)
-            try:
-                result = self.commands.export_dxf({"path": path})
-            finally:
-                self.commands.vs = original_vs
+    def test_import_dwg_calls_ImportDXFDWG(self):
+        calls = []
+        original_vs = self.commands.vs
+        self.commands.vs = types.SimpleNamespace(
+            ImportDXFDWG=lambda p, flag: calls.append(p),
+            ActLayer=lambda: None, GetLName=lambda h: "Layer-1")
+        try:
+            result = self.commands.import_dwg({"path": "/tmp/test.dwg"})
+        finally:
+            self.commands.vs = original_vs
         self.assertEqual(result["status"], "ok")
-        self.assertGreater(result["size"], 0)
+        self.assertEqual(calls, ["/tmp/test.dwg"])
+
+    def test_export_dxf_returns_error(self):
+        # VW2027: ExportDXFDWG_Batch does not exist; fails honestly.
+        result = self.commands.export_dxf({})
+        self.assertIn("error", result)
+
+    def test_export_dxf_with_path_still_returns_error(self):
+        # Even with a path, export_dxf fails — no scriptable API exists.
+        result = self.commands.export_dxf({"path": "/tmp/out.dxf"})
+        self.assertIn("error", result)
 
 
 if __name__ == "__main__":
