@@ -6322,10 +6322,17 @@ def get_georeferencing(p):
 # ── Textures ────────────────────────────────────────────────────────────────
 
 def get_textures(p):
+    # Textures are resources: the old 'T=TEXTURE' criteria walk never saw them and
+    # reported count 0 while the KitchenNook file held two (2026-10-24, VW2027).
+    # Same bug class as get_symbols; enumerate with BuildResourceList type 97.
     txs = []
-    for h in _collect('T=TEXTURE'):
-        txs.append({'name': _safe(lambda: vs.GetName(h)),
-                    'object_id': _oid(h)})
+    for nm in _resource_names(97):
+        h = _safe(lambda: vs.GetObject(nm))
+        txs.append({'name': nm, 'object_id': _oid(h) if h else None})
+    if not txs:                                    # old path as a fallback
+        for h in _collect('T=TEXTURE'):
+            txs.append({'name': _safe(lambda: vs.GetName(h)),
+                        'object_id': _oid(h)})
     return {'textures': txs, 'count': len(txs)}
 
 def apply_texture(p):
