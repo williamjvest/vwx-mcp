@@ -9,7 +9,9 @@
 # (document mutation there crashed VW, verified 2026-07-06). This command
 # drains the ENTIRE job queue via vwx_pump.pump_all() and returns immediately.
 # The native VwxBridge palette triggers it when jobs wait; read-only jobs drain
-# in the background without it.
+# in the background without it. macOS has no native palette: the
+# vwx-pump-watcher LaunchAgent clicks this menu item for EVERY job, so the menu
+# command must exist under exactly the name "VWX Bridge Start".
 #
 # Every run leaves a trace (bridge.log, or %TEMP%\vwx_bridgestart.log when the
 # plug-in folder is not found), so "the command did nothing" is never silent.
@@ -21,8 +23,11 @@ import importlib
 
 def _trace(msg, where=None):
     line = '[%s] start: %s\n' % (time.strftime('%H:%M:%S'), msg)
+    # TEMP is Windows-only; macOS has TMPDIR. Without the fallback a macOS
+    # failure to find the plug-in folder would leave no trace at all.
+    _tmp = os.environ.get('TEMP') or os.environ.get('TMPDIR') or '/tmp'
     for p in ((os.path.join(where, 'bridge.log') if where else None),
-              os.path.join(os.environ.get('TEMP', ''), 'vwx_bridgestart.log')):
+              os.path.join(_tmp, 'vwx_bridgestart.log')):
         if not p:
             continue
         try:
