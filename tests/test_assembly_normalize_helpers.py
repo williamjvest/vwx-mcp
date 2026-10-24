@@ -52,19 +52,19 @@ class AssemblyNormalizeHelperTests(unittest.TestCase):
         self.assertEqual(tgt, (0, 0, 0))
         self.assertEqual(up, (0, 0, 1))
 
-    def test_named_view_falls_back_to_top_on_unknown_value(self):
-        # Unknown views default to 'top' (no error — upstream behavior).
+    def test_named_view_rejects_unknown_value_without_calling_vectorworks(self):
+        # A typo must not throw away the user's composed camera (upstream
+        # vw2027 silently fell back to 'top').
         calls = []
         original_vs = self.commands.vs
         self.commands.vs = types.SimpleNamespace(
-            SetViewVector=lambda loc, tgt, up: calls.append((loc, tgt, up)))
+            SetViewVector=lambda *args: calls.append(args))
         try:
             result = self.commands.set_3d_view({"view": "diagonalish"})
         finally:
             self.commands.vs = original_vs
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], (0, 0, 1))  # defaulted to top
+        self.assertIn("error", result)
+        self.assertEqual(calls, [])
 
     def test_projection_fails_closed_without_calling_vectorworks(self):
         calls = []

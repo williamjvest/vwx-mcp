@@ -269,33 +269,39 @@ def get_document_preferences(p):
 def set_document_preferences(p):
     """Set document preferences. params: {units, scale}.
 
-    scale applies to the ACTIVE LAYER — in VW the scale lives on the layer,
-    not the document.
+    units (mm/cm/m/inch/feet) goes through vs.Units(i), VW's STANDARD unit
+    presets, which set display and rounding as one coherent standard. That is
+    why it is safe where hand-built vs.SetUnits(...) arguments are not. Live-
+    verified on VW2026 (Emmett, 2026-07-25): mm reads back 25.4 units/inch.
+    The mechanical/3D-print workflow depends on this; do not drop it on merge.
 
-    units is NOT settable from here. vs.SetUnits(fraction, display, format,
-    upi, name, squareName) takes six low-level values, not a name like "mm":
-    upi is units-per-inch (25.4 for mm, 2.54 for cm, 0.0254 for m) and the
-    remaining four control display and rounding. Guessing the other five from
-    a unit name would quietly change how every dimension in the document is
-    displayed. The server used to accept units= and pass it here, where
-    nothing read it and the command still answered ok — so a caller setting
-    units got a success for something that never happened. Now it says so.
+    scale applies to the ACTIVE LAYER -- in VW the scale lives on the layer,
+    not the document.
     """
-    out = {'status': 'ok'}
+    unit_index = None
+    requested_units = p.get('units')
+    if requested_units:
+        key = str(requested_units).strip().lower()
+        unit_index = {
+            'mm': 7, 'millimeter': 7, 'millimeters': 7,
+            'cm': 8, 'centimeter': 8, 'centimeters': 8,
+            'm': 9, 'meter': 9, 'meters': 9,
+            'inch': 2, 'inches': 2, 'in': 2,
+            'feet': 3, 'foot': 3, 'ft': 3,
+        }.get(key)
+        if unit_index is None:
+            return {'error': 'unsupported units: %s (use mm/cm/m/inch/feet)'
+                    % requested_units}
+    out = {'status': 'ok', 'units': requested_units, 'scale': p.get('scale')}
+    if unit_index is not None:
+        vs.Units(unit_index)
     if p.get('scale') is not None:
         h = vs.ActLayer()
         if h:
             _safe(lambda: vs.SetLScale(h, float(p['scale'])))
             out['scale_set_on_layer'] = _safe(lambda: vs.GetLName(h))
         else:
-            out['warning'] = 'no active layer — scale not applied'
-    if p.get('units') is not None:
-        out['units_ignored'] = (
-            'units cannot be set through this command: vs.SetUnits needs six '
-            'low-level values (fraction, display, format, units-per-inch, name, '
-            'squareName) and inferring five of them from a unit name would '
-            'silently change display and rounding for the whole document. '
-            'Use get_document_units to read the current setting.')
+            out['warning'] = 'no active layer -- scale not applied'
     return out
 
 
@@ -802,6 +808,25 @@ def get_classes(p):
                     'visible': _safe(lambda n=n: vs.GetCVis(n) == 0)}
                    for n in _class_names_used()]
     return {'classes': classes, 'count': len(classes), 'method': method}
+
+def _class_names_used():
+    """Sorted unique class names actually used by geometry (object walk).
+
+    Fallback for get_classes/_enumerate_class_names when ClassList fails.
+    Restored 2026-10-24: our branch had deleted it as unused, upstream kept
+    calling it, and the vw2027 merge left two NameErrors behind."""
+    seen = set()
+    def cb(h):
+        try:
+            c = vs.GetClass(h)
+            if c: seen.add(c)
+        except Exception:
+            pass
+    try:
+        vs.ForEachObject(cb, 'ALL')
+    except Exception:
+        pass
+    return sorted(seen)
 
 def _class_names_all():
     """Return every document class, including classes with no objects yet."""
@@ -5230,8 +5255,11 @@ def _named_view_angles(view):
 
 def set_3d_view(p):
     """Set the document's 3D view to a standard direction
-    (top/front/back/right/left/bottom/iso/iso_right/iso_left/trimetric)."""
-    view = p.get('view', 'top')
+    (top/front/back/right/left/bottom/iso/iso_right/iso_left/trimetric).
+
+    An unknown name is rejected WITHOUT touching Vectorworks: silently falling
+    back to 'top' would throw away the user's composed camera on a typo."""
+    view = str(p.get('view') or 'top').strip().lower()
     # (camera_location_direction, up_vector); target is always the origin.
     views = {
         'top':       ((0, 0, 1),   (0, 1, 0)),
@@ -5245,7 +5273,10 @@ def set_3d_view(p):
         'iso_left':  ((-1, -1, 1), (0, 0, 1)),
         'trimetric': ((-1, -1, 1), (0, 0, 1)),
     }
-    loc, up = views.get(view, views['top'])
+    if view not in views:
+        return {'error': 'unknown view', 'view': view,
+                'valid_views': sorted(views)}
+    loc, up = views[view]
     try:
         vs.SetViewVector(loc, (0, 0, 0), up)
         return {'status': 'ok', 'view': view}
@@ -6087,7 +6118,8 @@ def export_dxf(p):
     return {'error': ('DXF/DWG export is not scriptable on VW2026: the only '
                        'available function (vs.ExportDXFDWG) opens a modal '
                        'dialog and takes no path argument. vs.ExportDXFDWG_Batch, '
-                       'which this command used to call, does not exist.')}
+                       'which this command used to call, does not exist.'),
+            'code': 'MODAL_DIALOG_REQUIRED'}
 
 def export_image(p):
     """Not implementable on VW2026 — fails loudly instead of pretending.
@@ -6120,30 +6152,71 @@ def export_image(p):
             "export_image cannot rasterize the drawing on VW2026: "
             "vs.ExportImageFile(hImage, filePath) exports an Image OBJECT, not "
             "the document, and no headless render-to-file API exists. "
-            "To SEE the drawing use the `screenshot` tool (captures the "
-            "Vectorworks window and returns the picture directly). "
+            "To SEE the drawing use the `screenshot` tool on Windows or "
+            "`vwx-capture` on macOS. "
             "For a vector deliverable use `export_pdf`. To export an existing "
             "Image object, pass its object_id to this command.",
-            'path': path}
+            'path': path, 'code': 'MODAL_DIALOG_REQUIRED'}
 
-def import_dwg(p):
-    """Import a DXF/DWG file. params: {path, layer (optional target layer)}.
-
-    layer used to be accepted by the server and dropped here, so an import
-    aimed at a specific layer landed on whatever was active and still reported
-    ok. _with_layer_class/_restore is the same pattern the draw_* commands use.
-    """
-    path = p.get('path', '')
-    if not path: return {'error': 'path required'}
-    prev = _with_layer_class(p)
+def export_stl(p):
+    """Headless STL export with explicit path and post-write verification."""
+    path = str(p.get('path', '') or '').strip()
+    if not path or not os.path.isabs(path):
+        return {'error': 'absolute .stl path required'}
+    if not path.lower().endswith('.stl'):
+        return {'error': 'export path must end in .stl'}
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        return {'error': 'export directory does not exist: %s' % parent}
     try:
-        vs.ImportDXFDWG(path, False)
-        return {'status': 'ok', 'path': path,
-                'layer': _safe(lambda: vs.GetLName(vs.ActLayer()))}
+        tess = float(p.get('tessellation', 50.0))
+    except (TypeError, ValueError):
+        return {'error': 'tessellation must be a number from 0 to 100'}
+    if not 0.0 <= tess <= 100.0:
+        return {'error': 'tessellation must be from 0 to 100'}
+    scope = str(p.get('scope', 'selected') or 'selected').lower()
+    options = {'selected': 0, 'active_layer': 1, 'all': 2}
+    if scope not in options:
+        return {'error': 'scope must be selected, active_layer, or all'}
+    if scope == 'selected' and not _collect('SEL=TRUE', 1):
+        return {'error': 'no visible objects selected for STL export'}
+    binary = bool(p.get('binary', True))
+    before = _safe(lambda: (os.path.getsize(path), os.stat(path).st_mtime_ns))
+    try:
+        ok = bool(vs.ExportSTL(path, binary, tess, options[scope]))
     except Exception as e:
         return {'error': str(e)}
-    finally:
-        _restore(prev)
+    if not ok:
+        return {'error': 'Vectorworks ExportSTL returned false', 'path': path}
+    if not os.path.isfile(path):
+        return {'error': 'Vectorworks reported success but no STL was written',
+                'path': path}
+    after = (os.path.getsize(path), os.stat(path).st_mtime_ns)
+    if before is not None and after == before:
+        return {'error': 'STL output file was not updated', 'path': path}
+    if after[0] <= 0:
+        return {'error': 'STL export wrote an empty file', 'path': path}
+    return {'status': 'ok', 'path': path, 'size': after[0],
+            'binary': binary, 'tessellation': tess, 'scope': scope}
+
+def import_dwg(p):
+    """DWG/DXF import is not unattended-safe: fail closed.
+
+    vs.ImportDXFDWG takes NO arguments (vs_index, 2026 and 2027): it opens the
+    interactive import UI. Calling it with (path, False), as upstream vw2027
+    does, is an arity error, which VW reports in a modal Script Errors window
+    that blocks the bridge until someone dismisses it. params: {path} is kept
+    for schema compatibility only.
+    """
+    return {
+        'error': 'DWG/DXF import requires manual interaction',
+        'code': 'MODAL_DIALOG_REQUIRED',
+        'detail': (
+            'vs.ImportDXFDWG takes no path and opens a modal import dialog, so '
+            'import_dwg cannot succeed in an unattended bridge call. Import '
+            'DWG/DXF manually via File > Import > Import DXF/DWG.'
+        ),
+    }
 
 def export_shp(p):
     """Export to Shapefile (GIS export).
@@ -6155,7 +6228,8 @@ def export_shp(p):
     """
     return {'error': ('SHP export is not scriptable on VW2026: vs.ExportSHP '
                        'does not exist, and the only related function '
-                       '(vs.LegacyShapefileExp) opens a modal dialog.')}
+                       '(vs.LegacyShapefileExp) opens a modal dialog.'),
+            'code': 'MODAL_DIALOG_REQUIRED'}
 
 def import_image(p):
     """Import an image file as an image object. params: {path, x, y, layer}.

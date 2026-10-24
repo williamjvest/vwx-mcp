@@ -68,6 +68,13 @@ VWX_MODAL_GRACE = float(os.environ.get("VWX_MODAL_GRACE", "2"))
 # Heartbeat already older than this when a call starts = bridge is off, fail
 # immediately (no grace wait).
 VWX_ALIVE_STALE = float(os.environ.get("VWX_ALIVE_STALE", "60"))
+# Only the native palette (a Windows-only C++ plug-in) writes ipc/native.alive.
+# macOS drains jobs through the vwx-pump-watcher LaunchAgent and the Python
+# "VWX Bridge Start" menu command, which write no heartbeat, so there a missing
+# heartbeat means UNKNOWN, not down. Without this every macOS call failed at
+# once with VW_BRIDGE_DOWN (found in the vw2027 merge, 2026-10-24).
+VWX_NATIVE_HEARTBEAT = os.environ.get(
+    "VWX_NATIVE_HEARTBEAT", "1" if sys.platform == "win32" else "0") == "1"
 # File-transport result polling is active only while a tool call is waiting.
 # 10ms keeps CPU negligible but removes most of the old 30ms quantization delay.
 VWX_RESULT_POLL = max(0.003, float(os.environ.get("VWX_RESULT_POLL", "0.01")))
@@ -102,8 +109,23 @@ VWX_WAKE_TIMEOUT = float(os.environ.get('VWX_WAKE_TIMEOUT', '25'))
 # dir; the watchdog fires the pump menu command per job, VW stays responsive
 # for the user (no modal bridge dialog). 'tcp' = classic dialog-pump bridge
 # on :9878 (the only option on macOS / remote setups).
+# macOS defaults to file IPC too: the TCP bridge runs mutations from a timer
+# callback, which crashed Vectorworks twice on 2026-07-25 (see README).
 VWX_TRANSPORT = os.environ.get(
-    'VWX_TRANSPORT', 'file' if sys.platform == 'win32' else 'tcp').lower()
+    'VWX_TRANSPORT',
+    'file' if sys.platform in ('win32', 'darwin') else 'tcp').lower()
+
+
+def _vw_user_root():
+    """Per-user Vectorworks folder that holds <year>/Plug-ins.
+
+    Windows: %APPDATA%\\Nemetschek\\Vectorworks. macOS has no APPDATA and uses
+    ~/Library/Application Support/Vectorworks."""
+    appdata = os.environ.get('APPDATA', '')
+    if appdata:
+        return os.path.join(appdata, 'Nemetschek', 'Vectorworks')
+    return os.path.expanduser('~/Library/Application Support/Vectorworks')
+
 
 def vw_versions():
     """Vectorworks major versions installed for this user, newest first.
@@ -116,8 +138,7 @@ def vw_versions():
     forced = os.environ.get('VWX_VW_VERSION')
     if forced:
         return [forced]
-    root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
-                        'Vectorworks')
+    root = _vw_user_root()
     try:
         found = [d for d in os.listdir(root)
                  if len(d) == 4 and d.isdigit()
@@ -131,11 +152,10 @@ def _plugin_dir():
     base = os.environ.get('VWX_PLUGIN_DIR')
     if base and os.path.isdir(base):
         return base
-    appdata = os.environ.get('APPDATA', '')
+    root = _vw_user_root()
     for version in vw_versions():
         for name in ('VW-MCP', 'VWX-MCP'):
-            cand = os.path.join(appdata, 'Nemetschek', 'Vectorworks', version,
-                                'Plug-ins', name)
+            cand = os.path.join(root, version, 'Plug-ins', name)
             if os.path.isdir(cand):
                 return cand
     return None
@@ -175,7 +195,12 @@ class VwxFileTransport:
         to finish, waiting it out would mean a fifteen-minute hang for what is
         actually an immediately-knowable "the bridge is off" — so check first
         and keep checking.
+
+        alive is None when no heartbeat source exists (macOS, see
+        VWX_NATIVE_HEARTBEAT): callers must treat that as unknown, never down.
         """
+        if not VWX_NATIVE_HEARTBEAT:
+            return (None, False, float('inf'))
         try:
             with open(self.alive, 'r') as fh:
                 parts = fh.read().split()
@@ -203,6 +228,16 @@ class VwxFileTransport:
                 os.remove(job_path)
         except Exception:
             pass
+
+    def _busy(self):
+        """True while some job is claimed (<job>.json.working): VW is executing.
+
+        Without a heartbeat (macOS) this is the only evidence that an unclaimed
+        job is queued behind a running one rather than stuck."""
+        try:
+            return any(n.endswith('.working') for n in os.listdir(self.jobs))
+        except Exception:
+            return False
 
     def _read_result(self, cid):
         rp = os.path.join(self.results, cid + '.json')
@@ -247,7 +282,7 @@ class VwxFileTransport:
         # still booting, palette never opened) is not a hiccup — answer at once
         # instead of making every call wait the full grace (20 s each, 2026-10-02).
         alive, _, age = self.bridge_state()
-        if not alive and age > VWX_ALIVE_STALE:
+        if alive is False and age > VWX_ALIVE_STALE:
             self._discard(jp)
             seen = "never" if age == float('inf') else f"{age:.0f}s ago"
             return {'error': "the VWX Bridge palette is not running "
@@ -312,11 +347,25 @@ class VwxFileTransport:
                 # had already reported VW_BRIDGE_DOWN). Keep waiting for the
                 # result up to the normal timeout.
                 dead_since = None
+            elif alive is None and self._busy():
+                # No heartbeat (macOS): another job is executing ahead of ours.
+                dead_since = None
             else:
                 now = time.monotonic()
                 dead_since = dead_since or now
                 if now - dead_since > VWX_ALIVE_GRACE:
                     self._discard(jp)
+                    if alive is None:
+                        return {'error': (
+                            "no Vectorworks bridge picked the job up within "
+                            f"{VWX_ALIVE_GRACE:.0f}s. On macOS the vwx-pump-watcher "
+                            "LaunchAgent clicks Tools > VWX Bridge Start: usually "
+                            "a modal dialog is open in Vectorworks (the menu item "
+                            "is disabled - dismiss it with Escape), Vectorworks is "
+                            "not running, or the watcher is down (launchctl list | "
+                            "grep vwx-pump-watcher). The job never ran; safe to "
+                            "retry."),
+                            'cid': cid, 'code': 'VW_JOB_UNCLAIMED'}
                     seen = ("never" if age == float('inf')
                             else f"{age:.0f}s ago")
                     return {'error': "the VWX Bridge palette is not running "

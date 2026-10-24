@@ -363,6 +363,7 @@ class ExportFailClosedTests(unittest.TestCase):
         result = self.commands.export_image({"path": "/tmp/out.png"})
         self.assertIn("error", result)
         self.assertIn("ExportImageFile", result["error"])
+        self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
 
     def test_export_image_exports_image_object_when_object_id_supplied(self):
         import tempfile, os
@@ -389,38 +390,32 @@ class ExportFailClosedTests(unittest.TestCase):
         self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
         self.assertIn("modal", result["detail"].lower())
 
-    def test_export_shp_returns_error(self):
-        # VW2027: export_shp fails honestly — vs.ExportSHP does not exist.
+    def test_export_shp_returns_modal_required(self):
+        # vs.ExportSHP does not exist; the legacy exporter is modal.
         result = self.commands.export_shp({})
-        self.assertIn("error", result)
+        self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
 
-    def test_import_dwg_requires_path(self):
-        # VW2027: import_dwg calls vs.ImportDXFDWG — no path = error.
-        result = self.commands.import_dwg({})
-        self.assertIn("error", result)
-
-    def test_import_dwg_calls_ImportDXFDWG(self):
+    def test_import_dwg_returns_modal_required_without_calling_vectorworks(self):
+        # vs.ImportDXFDWG takes NO arguments and opens the import UI. Upstream
+        # vw2027 calls it as (path, False): an arity error, which VW shows in
+        # a modal Script Errors window that blocks the bridge. Never call it.
         calls = []
         original_vs = self.commands.vs
         self.commands.vs = types.SimpleNamespace(
-            ImportDXFDWG=lambda p, flag: calls.append(p),
-            ActLayer=lambda: None, GetLName=lambda h: "Layer-1")
+            ImportDXFDWG=lambda *args: calls.append(args))
         try:
             result = self.commands.import_dwg({"path": "/tmp/test.dwg"})
         finally:
             self.commands.vs = original_vs
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(calls, ["/tmp/test.dwg"])
+        self.assertEqual(result["code"], "MODAL_DIALOG_REQUIRED")
+        self.assertEqual(calls, [])
 
-    def test_export_dxf_returns_error(self):
-        # VW2027: ExportDXFDWG_Batch does not exist; fails honestly.
-        result = self.commands.export_dxf({})
-        self.assertIn("error", result)
-
-    def test_export_dxf_with_path_still_returns_error(self):
-        # Even with a path, export_dxf fails — no scriptable API exists.
-        result = self.commands.export_dxf({"path": "/tmp/out.dxf"})
-        self.assertIn("error", result)
+    def test_export_dxf_returns_modal_required(self):
+        # ExportDXFDWG_Batch does not exist; ExportDXFDWG is modal.
+        self.assertEqual(self.commands.export_dxf({})["code"],
+                         "MODAL_DIALOG_REQUIRED")
+        self.assertEqual(self.commands.export_dxf({"path": "/tmp/out.dxf"})["code"],
+                         "MODAL_DIALOG_REQUIRED")
 
 
 if __name__ == "__main__":
