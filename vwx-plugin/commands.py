@@ -5470,8 +5470,14 @@ def set_marker(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     mmap = {'none': 0, 'arrow': 1, 'open_arrow': 2, 'dot': 5, 'slash': 6}
+    # An unknown name used to be skipped silently and still answer ok (sol review, 2026-11-06).
+    bad = [n for n in (p.get('start_marker'), p.get('end_marker')) if n and n not in mmap]
+    if bad:
+        return {'error': 'unknown marker %s' % ', '.join(map(repr, bad)), 'valid': sorted(mmap)}
     s = mmap.get(p.get('start_marker', ''), None)
     e = mmap.get(p.get('end_marker', ''), None)
+    if s is None and e is None:
+        return {'error': 'start_marker or end_marker required', 'valid': sorted(mmap)}
     try:
         # (object, style, angle, size, width, thicknessBasis, thickness, visibility).
         # The old 6-arg call set size=1.0 and left visibility False, so the
