@@ -49,7 +49,9 @@ class Harness:
                       "ran": [], "pending": None}
         vs = types.ModuleType("vs")
         vs.GetFName = lambda: self.state["active"]
-        vs.GetFPathName = lambda: "C:/proj/" + self.state["active"]
+        # An absolute path on THIS OS: _unsaved_document_error uses os.path.isabs, and
+        # "C:/proj/..." is relative on macOS, so every mutation got DOC_UNSAVED there.
+        vs.GetFPathName = lambda: os.path.join(os.path.abspath(os.sep), "proj", self.state["active"])
         sys.modules["vs"] = vs
         for m in ("vwx_pump", "commands"):
             sys.modules.pop(m, None)
