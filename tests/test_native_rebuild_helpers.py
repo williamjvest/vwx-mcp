@@ -11,6 +11,9 @@ COMMANDS_PATH = ROOT / "vwx-plugin" / "commands.py"
 
 def load_commands():
     sys.modules.setdefault("vs", types.SimpleNamespace())
+    # commands.py imports its sibling assembly_templates, as VW does from the plug-in dir.
+    if str(COMMANDS_PATH.parent) not in sys.path:
+        sys.path.insert(0, str(COMMANDS_PATH.parent))
     spec = importlib.util.spec_from_file_location("vwx_commands_test", COMMANDS_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
