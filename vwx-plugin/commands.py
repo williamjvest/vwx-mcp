@@ -6204,9 +6204,15 @@ def import_dwg(p):
 
     vs.ImportDXFDWG takes NO arguments (vs_index, 2026 and 2027): it opens the
     interactive import UI. Calling it with (path, False), as upstream vw2027
-    does, is an arity error, which VW reports in a modal Script Errors window
+    did, is an arity error, which VW reports in a modal Script Errors window
     that blocks the bridge until someone dismisses it. params: {path} is kept
     for schema compatibility only.
+
+    Upstream 3665155 (2026-11-03) now calls vs.ImportDXFDWGFile(path, True)
+    (arity 2, batch mode with the last-used import settings). Kept fail-closed
+    on merge (2026-11-06): it is not live-tested on macOS, and a first-run
+    settings dialog or an import report would be a modal nobody sees on a
+    headless Mac. Swap it in once a live run proves it opens no dialog.
     """
     return {
         'error': 'DWG/DXF import requires manual interaction',

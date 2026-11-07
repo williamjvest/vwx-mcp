@@ -52,16 +52,16 @@ check(sent[-1][2].get("_doc") == "Ernte_Staging.vwx", "resource_list of the fron
 
 print("locks")
 as_agent("session-B")
-S._locks[S._doc_key("Wiesenredder.vwx")] = {"sid": "session-A", "agent": "agent A",
-                                             "doc": "Wiesenredder.vwx", "reason": "build",
+S._locks[S._doc_key("Projekt.vwx")] = {"sid": "session-A", "agent": "agent A",
+                                             "doc": "Projekt.vwx", "reason": "build",
                                              "until": __import__("time").time() + 3600}
-r = json.loads(S.cmd("draw_rectangle", {}, document="C:/p/Wiesenredder.vwx"))
+r = json.loads(S.cmd("draw_rectangle", {}, document="C:/p/Projekt.vwx"))
 check(r.get("code") == "DOC_LOCKED", "other session cannot write a locked document")
 n = len(sent)
-S.cmd("get_layers", {}, document="Wiesenredder.vwx")
+S.cmd("get_layers", {}, document="Projekt.vwx")
 check(len(sent) == n + 1, "reads of a locked document still go through")
 as_agent("session-A")
-S.cmd("draw_rectangle", {}, document="Wiesenredder.vwx")
+S.cmd("draw_rectangle", {}, document="Projekt.vwx")
 check(sent[-1][0] == "draw_rectangle", "the lock holder can write")
 S._locks.clear()
 
