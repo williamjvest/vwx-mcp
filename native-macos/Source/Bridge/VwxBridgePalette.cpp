@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <cstdint>
 #include <CoreFoundation/CoreFoundation.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <string>
 
 using namespace VwxBridge;
 
@@ -54,19 +57,39 @@ static const StatusData kVwxMagic   = 0x56575850;   // 'VWXP' — filters our ow
 // --------------------------------------------------------------------------------------------------------
 // Helpers: VW-MCP plugin folder (job queue home) + job counting via POSIX.
 
+// The queue lives under the Vectorworks year this binary was built for:
+// SDK_VERSION 3200 = 2027, 3100 = 2026 (same rule as the Windows build).
+// VWX_VW_VERSION forces a year, matching the Python side. Cached: this runs on
+// every 0.1 s timer tick. (Upstream's port hard-coded 2026.)
+static std::string VwxHostYear()
+{
+	if ( const char* forced = getenv("VWX_VW_VERSION") )
+		if ( forced[0] )
+			return forced;
+	return std::to_string( SDK_VERSION / 100 + 1995 );
+}
+
 static TXString VwxPluginDir()
 {
+	static bool     resolved = false;
+	static TXString cached;
+	if ( resolved )
+		return cached;
 	const char* home = getenv("HOME");
 	if ( home == nullptr )
 		return "";
-	for ( const char* name : { "VW-MCP", "VWX-MCP" } ) {
+	const std::string year = VwxHostYear();
+	for ( const char* name : { "VWX-MCP", "VW-MCP" } ) {
 		TXString dir;
-		dir << home << "/Library/Application Support/Vectorworks/2026/Plug-ins/" << name;
+		dir << home << "/Library/Application Support/Vectorworks/" << year.c_str() << "/Plug-ins/" << name;
 		struct stat sb;
-		if ( stat( dir.GetCharPtr(), &sb ) == 0 && S_ISDIR(sb.st_mode) )
-			return dir;
+		if ( stat( dir.GetCharPtr(), &sb ) == 0 && S_ISDIR(sb.st_mode) ) {
+			cached = dir;
+			resolved = true;
+			return cached;
+		}
 	}
-	return "";
+	return "";   // not cached: the folder may be deployed later in this session
 }
 
 static int CountJobs(const TXString& pluginDir)
@@ -141,10 +164,15 @@ static void LogLine(const char* msg)
 // point: pump_readonly() drains only read-only jobs (safe anywhere);
 // pump_all() drains everything (genuine dispatch only).
 static const char* kPumpReadonlyScript =
-	"import os, sys, importlib\n"
-	"p = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', '2026', 'Plug-ins', 'VW-MCP')\n"
+	"import os, sys, importlib, re\n"
+	"v = os.environ.get('VWX_VW_VERSION')\n"
+	"if not v:\n"
+	"    m = re.search(r'Vectorworks ?(\\d{4})', (sys.executable or '') + ' ' + (sys.prefix or ''))\n"
+	"    v = m.group(1) if m else '2027'\n"
+	"b = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', v, 'Plug-ins')\n"
+	"p = os.path.join(b, 'VWX-MCP')\n"
 	"if not os.path.isdir(p):\n"
-	"    p = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', '2026', 'Plug-ins', 'VWX-MCP')\n"
+	"    p = os.path.join(b, 'VW-MCP')\n"
 	"if p not in sys.path:\n"
 	"    sys.path.insert(0, p)\n"
 	"try:\n"
@@ -224,8 +252,31 @@ static void SendForegroundHotkey()
 }
 
 // Fire triggers. Called from the heartbeat timer when jobs are queued.
+// Hold while Vectorworks has a modal up: an app-modal dialog (NSApp.modalWindow)
+// or a sheet on any window (save panels). Upstream's port stubbed this to false,
+// so DoMenuName could fire the pump into an open dialog. The macOS watcher this
+// replaces never clicked a disabled menu item, so keep that guarantee. In-process
+// AppKit query: no Accessibility permission involved.
 static bool ModalDialogOpen()
 {
+	typedef id   (*MsgId)(id, SEL);
+	typedef id   (*MsgIdIdx)(id, SEL, unsigned long);
+	typedef unsigned long (*MsgUL)(id, SEL);
+	Class appClass = objc_getClass("NSApplication");
+	if ( appClass == nullptr )
+		return false;
+	id app = ((MsgId) objc_msgSend)( (id) appClass, sel_registerName("sharedApplication") );
+	if ( app == nullptr )
+		return false;
+	if ( ((MsgId) objc_msgSend)( app, sel_registerName("modalWindow") ) != nullptr )
+		return true;
+	id windows = ((MsgId) objc_msgSend)( app, sel_registerName("windows") );
+	unsigned long n = windows ? ((MsgUL) objc_msgSend)( windows, sel_registerName("count") ) : 0;
+	for ( unsigned long i = 0; i < n; ++i ) {
+		id w = ((MsgIdIdx) objc_msgSend)( windows, sel_registerName("objectAtIndex:"), i );
+		if ( w && ((MsgId) objc_msgSend)( w, sel_registerName("attachedSheet") ) != nullptr )
+			return true;
+	}
 	return false;
 }
 
