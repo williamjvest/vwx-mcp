@@ -372,6 +372,7 @@ CVwxJSProvider::~CVwxJSProvider()
 
 void CVwxJSProvider::OnInit(IInitContext* context)
 {
+	LogLine( "palette JS provider OnInit" );
 	fWebFrame = context->GetWebFrame();
 
 	// creates the window.vwxBridge integrator object on the JS side
@@ -458,11 +459,46 @@ bool CExtVwxBridgePalette::GetMinimalSize(ViewCoord& outCX, ViewCoord& outCY)
 	return true;
 }
 
+// Headless autostart (macOS, 2026-11-06). On VW 2027 the show-palette menu command never
+// reaches DoInterface from the workspace menu, and an unattended Mac has nobody to open
+// a palette anyway. VW builds this palette at launch (GetInitialURL is called then), so
+// arm a one-shot main-run-loop timer here that starts the pump timer 8 s later, once
+// startup has settled. Not from plugin_module_main: upstream found arming anything
+// during module registration crashes VW at boot. VWX_NATIVE_AUTOSTART=0 disables it.
+static void AutoStartTimerProc(CFRunLoopTimerRef, void*)
+{
+	LogLine( "autostart: starting the pump timer without the palette" );
+	VwxBridge_StartPumpTimer();
+}
+
+static void ArmAutoStart()
+{
+	static bool armed = false;
+	if ( armed )
+		return;
+	armed = true;
+	if ( const char* v = getenv("VWX_NATIVE_AUTOSTART") )
+		if ( v[0] == '0' ) {
+			LogLine( "autostart disabled (VWX_NATIVE_AUTOSTART=0)" );
+			return;
+		}
+	CFRunLoopTimerContext ctx = { 0 };
+	CFRunLoopTimerRef t = CFRunLoopTimerCreate( kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 8.0, 0, 0, 0, AutoStartTimerProc, &ctx );
+	CFRunLoopAddTimer( CFRunLoopGetMain(), t, kCFRunLoopCommonModes );
+	CFRelease( t );
+	LogLine( "autostart armed (8 s)" );
+}
+
 TXString CExtVwxBridgePalette::GetInitialURL()
 {
+	ArmAutoStart();
 	const TXString	htmlFolderName	= "html";
 	const TXString	htmlFile		= "index.html";
-	return VWFC::PluginSupport::GetStandardURL( htmlFolderName, htmlFile );
+	TXString url = VWFC::PluginSupport::GetStandardURL( htmlFolderName, htmlFile );
+	TXString msg;
+	msg << "palette GetInitialURL: " << url;
+	LogLine( msg.GetCharPtr() );
+	return url;
 }
 
 // --------------------------------------------------------------------------------------------------------
@@ -517,7 +553,9 @@ CExtMenuShowVwxBridge_EventSink::~CExtMenuShowVwxBridge_EventSink()
 
 void CExtMenuShowVwxBridge_EventSink::DoInterface()
 {
+	LogLine( "show-palette DoInterface reached" );
 	gSDK->SetWebPaletteVisibility( CExtVwxBridgePalette::_GetIID(), true );
+	LogLine( "show-palette SetWebPaletteVisibility returned" );
 }
 
 // --------------------------------------------------------------------------------------------------------
